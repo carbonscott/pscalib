@@ -42,6 +42,18 @@ drift).  See the README "psdata relationship" section.
 from . import _purity  # noqa: F401
 from ._purity import FORBIDDEN_MODULES, assert_no_framework_imports
 
+# The constants contract + staleness enforcement (US-002).  Pure-python; carries
+# only validity metadata (run-ranges + pin), never arrays -- so importing it adds
+# no dependency beyond the stdlib.
+from . import model     # noqa: F401
+from .model import (
+    StaleConstantsError,
+    Validity,
+    Pin,
+    check_validity,
+    validities_from_calibconst,
+)
+
 # The pure-numpy apply / geometry / image / render engine (US-000).  These pull
 # in only numpy at import time; the psana touches (snapshot capture, geometry
 # derivation) are lazy function-body imports inside the relevant functions.
@@ -66,8 +78,10 @@ from .providers.snapshot import (
 )
 
 __all__ = [
-    "apply", "geometry", "image", "render", "providers",
+    "apply", "geometry", "image", "render", "providers", "model",
     "FORBIDDEN_MODULES", "assert_no_framework_imports",
+    "StaleConstantsError", "Validity", "Pin", "check_validity",
+    "validities_from_calibconst",
     "calib_jungfrau",
     "pixel_coord_indexes_from_text", "cache_pixel_indexes_for_snapshot",
     "load_pixel_indexes",

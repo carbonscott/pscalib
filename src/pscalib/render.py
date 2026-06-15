@@ -100,22 +100,51 @@ class HDRImager:
         self._rc_tot_max = [int(np.max(self.ix.ravel())),
                             int(np.max(self.iy.ravel()))]
 
+    # -- staleness enforcement (US-002) -----------------------------------
+    def check_run(self, run, allow_stale=False):
+        """Enforce that this imager's snapshot constants are valid for ``run``
+        (refuse-by-default; US-002).
+
+        Delegates to :meth:`CalibSnapshot.check_validity`:
+
+        * in range -- returns silently (empty offender list);
+        * out of range and ``allow_stale=False`` (default) -- raises
+          :class:`pscalib.model.StaleConstantsError`;
+        * out of range and ``allow_stale=True`` -- logs a warning and returns
+          the offenders.
+
+        :meth:`calib` / :meth:`render` call this automatically when given a
+        ``run`` argument; call it directly to enforce without rendering.
+        """
+        return self.snapshot.check_validity(run, allow_stale=allow_stale)
+
     # -- the two products -------------------------------------------------
-    def calib(self, raw):
+    def calib(self, raw, run=None, allow_stale=False):
         """Calibrate a raw stack into ADU (``== det.raw.calib(evt)``).
 
         Parameters
         ----------
         raw : ndarray ``(N, 512, 1024)`` uint16
+        run : int | None
+            If given, ENFORCE that the snapshot's constants are valid for this
+            run *before* calibrating (US-002, refuse-by-default).  Out-of-range
+            raises :class:`pscalib.model.StaleConstantsError` unless
+            ``allow_stale=True``.  ``None`` (default) skips the check entirely --
+            backward-compatible with the pre-US-002 zero-arg call.
+        allow_stale : bool
+            Downgrade an out-of-range refusal to a logged warning (only
+            consulted when ``run`` is not ``None``).
 
         Returns
         -------
         ndarray ``(N, 512, 1024)`` float32
         """
+        if run is not None:
+            self.check_run(run, allow_stale=allow_stale)
         return self._calibrate(raw, self.pedestals, self.pixel_gain,
                                self.pixel_offset, self.mask)
 
-    def image(self, calib_or_raw, is_raw=False):
+    def image(self, calib_or_raw, is_raw=False, run=None, allow_stale=False):
         """Assemble the calibrated 2-D image (``== det.raw.image(evt)``).
 
         Parameters
@@ -125,23 +154,40 @@ class HDRImager:
             stack to calibrate first.
         is_raw : bool
             Treat the input as raw uint16 and calibrate it before assembly.
+        run : int | None
+            Enforce validity for this run when ``is_raw=True`` (ignored
+            otherwise -- a pre-calibrated stack has no raw to re-check).  See
+            :meth:`calib`.
+        allow_stale : bool
+            Downgrade an out-of-range refusal to a logged warning.
 
         Returns
         -------
         ndarray, 2-D, float32  (e.g. ``(4216, 4432)`` for Jungfrau 8M)
         """
-        calib = self.calib(calib_or_raw) if is_raw else calib_or_raw
+        if is_raw:
+            calib = self.calib(calib_or_raw, run=run, allow_stale=allow_stale)
+        else:
+            calib = calib_or_raw
         return _image.assemble_image(calib, self.ix, self.iy,
                                      rc_tot_max=self._rc_tot_max)
 
-    def render(self, raw):
+    def render(self, raw, run=None, allow_stale=False):
         """Full pipeline: raw -> (calib, image).  Convenience wrapper.
+
+        Parameters
+        ----------
+        raw : ndarray ``(N, 512, 1024)`` uint16
+        run : int | None
+            If given, ENFORCE validity for this run before rendering (US-002).
+        allow_stale : bool
+            Downgrade an out-of-range refusal to a logged warning.
 
         Returns
         -------
         (calib, image) : (ndarray (N,512,1024) f32, ndarray 2-D f32)
         """
-        calib = self.calib(raw)
+        calib = self.calib(raw, run=run, allow_stale=allow_stale)
         image = self.image(calib)
         return calib, image
 

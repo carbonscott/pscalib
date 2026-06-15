@@ -69,6 +69,8 @@ from bson.objectid import ObjectId
 
 __all__ = [
     "get_constants",
+    "validities",
+    "pin",
     "calib_constants_all_types",
     "calib_constants",
     "URL",
@@ -719,3 +721,28 @@ def get_constants(uniqueid, exp, run, url=None):
         ``doc`` the metadata document (carries the validity range).
     """
     return calib_constants_all_types(uniqueid, exp=exp, run=int(run), url=url)
+
+
+# ==========================================================================
+# US-002: pin + per-ctype validity for a web fetch
+# ==========================================================================
+def validities(constants):
+    """Map a fetched ``{ctype: (data, doc)}`` dict (from :func:`get_constants`)
+    to ``{ctype: pscalib.model.Validity}``.
+
+    Each web ``doc`` carries the ``run`` / ``run_end`` validity fields psana's
+    ``select_doc_in_run_range`` selects on, so a web fetch carries the same
+    enforceable per-ctype validity a snapshot does (US-002).  Imported lazily so
+    the numpy-only import surface of :mod:`pscalib.model` is not pulled by simply
+    importing the (web-extra) provider module.
+    """
+    from ..model import validities_from_calibconst
+    return validities_from_calibconst(constants)
+
+
+def pin(uniqueid, run, detname=None, exp=None):
+    """Build the :class:`pscalib.model.Pin` for a web fetch -- the
+    ``(detector_uniqueid, run)`` identity the constants were fetched for (the
+    web-fetch analogue of :attr:`CalibSnapshot.pin_obj`)."""
+    from ..model import Pin
+    return Pin(detector_uniqueid=uniqueid, run=run, detname=detname, exp=exp)

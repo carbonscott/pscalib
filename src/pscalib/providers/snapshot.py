@@ -42,6 +42,7 @@ from .._purity import (  # noqa: F401  (re-exported for back-compat)
     FORBIDDEN_MODULES as _FORBIDDEN_MODULES,
     assert_no_framework_imports,
 )
+from ..model import Pin, Validity, validities_from_calibconst, check_validity
 
 #: Calibration ctypes the snapshot is *expected* to carry for an area detector.
 #: ``snapshot_calib`` actually persists *every* ndarray ctype psana returns
@@ -146,10 +147,49 @@ class CalibSnapshot:
         sentinel ``'end'``)."""
         return dict(self._manifest["validity"].get(ctype, {}))
 
+    def validity_obj(self, ctype):
+        """The :class:`pscalib.model.Validity` for ``ctype`` (the parsed
+        ``[run, run_end]`` range), or ``None`` if the ctype carries no
+        parseable ``run`` field.  US-002's typed view over :meth:`validity`."""
+        meta = self._manifest["validity"].get(ctype, {})
+        try:
+            return Validity.from_meta(meta)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def validities(self):
+        """Map ``{ctype: Validity}`` over every array ctype (+ geometry) that
+        declares a parseable run-range.  This is what the staleness enforcement
+        (:meth:`check_validity`) checks."""
+        return validities_from_calibconst(self.calibconst())
+
     @property
     def pin(self):
         """The ``(detector_uniqueid, run)`` pin (plus detname/exp) as a dict."""
         return dict(self._manifest["pin"])
+
+    @property
+    def pin_obj(self):
+        """The :class:`pscalib.model.Pin` identity (typed view over
+        :attr:`pin`)."""
+        return Pin.from_snapshot_pin(self._manifest["pin"])
+
+    def check_validity(self, run, allow_stale=False, log=None):
+        """Enforce that this snapshot's constants are valid for ``run``
+        (refuse-by-default; US-002).
+
+        Delegates to :func:`pscalib.model.check_validity`:
+
+        * in range -- returns the (empty) offender list silently;
+        * out of range and ``allow_stale=False`` (default) -- raises
+          :class:`pscalib.model.StaleConstantsError`;
+        * out of range and ``allow_stale=True`` -- logs a warning and returns
+          the offenders.
+
+        Unlike :meth:`is_valid_for_run` (advisory bool), this *enforces*.
+        """
+        return check_validity(self.validities(), run, allow_stale=allow_stale,
+                              pin=self.pin_obj, log=log)
 
     def calibconst(self):
         """Reconstruct psana's ``det.raw._calibconst`` dict:
