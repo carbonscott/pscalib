@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pscalib"
+version = "0.1.0"
+description = "Standalone, pure-Python LCLS-II calibration package -- retrieve calibration constants (snapshot-to-disk or a requests-only web-DB client) and apply them in pure numpy, byte-exact vs psana. The calibration sibling to the psdata reader."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Cong Wang", email = "cwang31@stanford.edu" }]
+# Core is numpy-only. pscalib DEPENDS on the numpy-only psdata reader (for raw
+# arrays and -- from US-003 -- the detector Configure object). It does NOT
+# depend on psana: psana's import chain pulls mpi4py/dgram (any psana.* import
+# runs psana/__init__.py), so the web-DB retrieval functions are VENDORED, not
+# imported. There is deliberately NO [psana] extra.
+dependencies = ["numpy", "psdata"]
+
+[project.optional-dependencies]
+# Web-DB retrieval provider (US-001): a requests-only HTTP client over the
+# calib web service, with bson for the pure-python ObjectId (no Mongo socket).
+web = ["requests", "bson"]
+# Dev/test tooling only. The acceptance tests that cross-check against psana
+# need a working psana, which is the SLAC production conda build (sourced via
+# psconda.sh) -- NOT a pip/uv-installable package. There is deliberately no
+# [psana] extra; see the "Environment" section of the README.
+test = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pscalib"]
