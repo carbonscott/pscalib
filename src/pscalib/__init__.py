@@ -50,8 +50,10 @@ from .model import (
     StaleConstantsError,
     Validity,
     Pin,
+    Constants,
     check_validity,
     validities_from_calibconst,
+    detector_type_hint,
 )
 
 # The pure-numpy apply / geometry / image / render engine (US-000).  These pull
@@ -84,17 +86,18 @@ from .registry import (
     get_plugin,
     registered_types,
     detector_type_of,
+    detector_type_for_constants,
 )
 
 __all__ = [
     "apply", "geometry", "image", "render", "providers", "model", "registry",
     "FORBIDDEN_MODULES", "assert_no_framework_imports",
-    "StaleConstantsError", "Validity", "Pin", "check_validity",
-    "validities_from_calibconst",
+    "StaleConstantsError", "Validity", "Pin", "Constants", "check_validity",
+    "validities_from_calibconst", "detector_type_hint",
     "calib_jungfrau",
     "calib_epix10ka", "mask_from_pixel_status",
     "registry", "calib", "register", "get_plugin", "registered_types",
-    "detector_type_of",
+    "detector_type_of", "detector_type_for_constants",
     "pixel_coord_indexes_from_text", "cache_pixel_indexes_for_snapshot",
     "load_pixel_indexes",
     "assemble_image",

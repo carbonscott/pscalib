@@ -31,8 +31,10 @@ __all__ = [
     "StaleConstantsError",
     "Validity",
     "Pin",
+    "Constants",
     "validity_from_meta",
     "validities_from_calibconst",
+    "detector_type_hint",
     "check_validity",
 ]
 
@@ -257,6 +259,179 @@ def validities_from_calibconst(calibconst):
         except (KeyError, TypeError, ValueError):
             continue
     return out
+
+
+# ==========================================================================
+# Detector-type hint extraction (US-005: infer the apply plugin from the
+# constants alone, so the public surface needs no det_type argument)
+# ==========================================================================
+#: Metadata keys (in priority order) that name a constant's detector type/name.
+#: psana attaches ``dettype`` (the bare family, e.g. ``'epix10ka'``) and
+#: ``detname`` (the short name, e.g. ``'epixquad'``) to every ``_calibconst``
+#: doc; either resolves to the right plugin once normalized.  See
+#: :data:`pscalib.providers.snapshot._META_KEEP`.
+_DETTYPE_META_KEYS = ("dettype", "detname", "detector")
+
+
+def detector_type_hint(constants):
+    """Best-effort detector-type/name string carried *by the constants*.
+
+    The US-005 public surface (:func:`pscalib.calib`) infers which apply plugin
+    to dispatch to from the constants alone -- it takes no ``det_type``
+    argument.  This pulls that hint, trying, in order:
+
+    * a :class:`pscalib.providers.snapshot.CalibSnapshot` -- its ``detname`` /
+      per-ctype ``dettype`` metadata (and the ``detector_uniqueid`` prefix);
+    * a :class:`Constants` adapter (delegates to its wrapped source);
+    * a psana-style ``{ctype: (data, meta)}`` dict -- the ``dettype`` /
+      ``detname`` / ``detector`` field of any ctype's metadata doc;
+    * an explicit ``det_type`` / ``dettype`` / ``detname`` key on a plain dict.
+
+    Returns the raw hint string (e.g. ``'epix10ka'``, ``'epixquad'``,
+    ``'jungfrau'``) for :func:`pscalib.registry.detector_type_of` to normalize,
+    or ``None`` if the constants carry no recoverable detector identity.
+    """
+    if constants is None:
+        return None
+
+    # a Constants adapter knows its own source -- unwrap to the real thing
+    if isinstance(constants, Constants):
+        constants = constants.source
+
+    # a CalibSnapshot exposes detname directly + dettype in per-ctype metadata
+    detname = getattr(constants, "detname", None)
+    if detname:
+        return detname
+    uid = getattr(constants, "detector_uniqueid", None)
+    if isinstance(uid, str) and "_" in uid:
+        # uniqueid looks like '<family>_<serial>...' (e.g. 'epix10ka_...')
+        return uid.split("_", 1)[0]
+
+    # mapping forms: scan ctype metadata docs, then explicit naming keys
+    if hasattr(constants, "items"):
+        for _ctype, value in constants.items():
+            meta = value[1] if isinstance(value, (tuple, list)) \
+                and len(value) > 1 else None
+            if isinstance(meta, dict):
+                for k in _DETTYPE_META_KEYS:
+                    if meta.get(k):
+                        return meta[k]
+        for k in ("det_type",) + _DETTYPE_META_KEYS:
+            if constants.get(k):
+                return constants[k]
+    return None
+
+
+# ==========================================================================
+# The uniform Constants contract (US-005)
+# ==========================================================================
+class Constants:
+    """A uniform, provider-agnostic view over a set of calibration constants.
+
+    US-005's "one uniform :class:`Constants` contract": whatever provider the
+    constants came from -- a snapshot (US-000), a web fetch (US-001), or a
+    caller-supplied (BYO) dict -- the apply path sees the same small surface:
+
+      * :meth:`array` -- the ndarray for a ctype (or ``None``);
+      * :meth:`validities` -- ``{ctype: Validity}`` for staleness enforcement;
+      * :attr:`det_type_hint` -- the detector-type/name the constants name
+        themselves with (so :func:`pscalib.calib` needs no ``det_type`` arg);
+      * :attr:`source` -- the wrapped object, passed *unchanged* to the plugin.
+
+    This is a thin, numpy-free *adapter*, not a copy: it holds a reference to the
+    wrapped source and forwards lookups.  The registry's apply plugins still
+    accept the bare source directly (a dict / snapshot), so ``Constants`` is
+    optional sugar that makes the contract explicit and testable -- wrapping is
+    idempotent (``Constants(Constants(x)).source is x``).
+
+    Parameters
+    ----------
+    source : Mapping | CalibSnapshot
+        A plain ``{ctype: ndarray}`` dict, a psana-style ``{ctype: (ndarray,
+        meta)}`` dict, or a :class:`pscalib.providers.snapshot.CalibSnapshot`.
+    pin : Pin | None
+        The ``(detector_uniqueid, run)`` identity, if known (a snapshot/web
+        fetch carries one; a BYO dict may not).
+    """
+
+    __slots__ = ("source", "_pin")
+
+    def __init__(self, source, pin=None):
+        if source is None:
+            raise ValueError("Constants source must not be None")
+        # idempotent: wrapping a Constants returns a view on the same source
+        if isinstance(source, Constants):
+            pin = pin if pin is not None else source._pin
+            source = source.source
+        self.source = source
+        self._pin = pin
+
+    @classmethod
+    def of(cls, source, pin=None):
+        """Coerce ``source`` to a :class:`Constants` (idempotent).  ``Constants``
+        instances are returned as-is; everything else is wrapped."""
+        if isinstance(source, cls):
+            return source
+        return cls(source, pin=pin)
+
+    def array(self, ctype):
+        """Return the ndarray for ``ctype`` (``None`` if absent), unwrapping the
+        psana-style ``(ndarray, meta)`` tuple form when present."""
+        src = self.source
+        if hasattr(src, "array") and callable(src.array):
+            if ctype == "mask":
+                m = getattr(src, "mask", None)
+                return m if m is not None else src.array("mask")
+            return src.array(ctype)
+        val = None
+        if hasattr(src, "get"):
+            val = src.get(ctype)
+        else:
+            try:
+                val = src[ctype]
+            except (KeyError, TypeError, IndexError):
+                val = None
+        if isinstance(val, (tuple, list)) and val and not isinstance(val, str) \
+                and hasattr(val[0], "shape"):
+            val = val[0]
+        return val
+
+    def calibconst(self):
+        """Return the underlying ``{ctype: (data, meta)}`` calibconst mapping,
+        reconstructing it from a :class:`CalibSnapshot` when needed."""
+        src = self.source
+        if hasattr(src, "calibconst") and callable(src.calibconst):
+            return src.calibconst()
+        return dict(src) if hasattr(src, "items") else {}
+
+    def validities(self):
+        """``{ctype: Validity}`` for the wrapped constants (US-002 enforcement
+        input).  Empty if the constants carry no parseable validity metadata
+        (e.g. a bare BYO ``{ctype: ndarray}`` dict)."""
+        src = self.source
+        if hasattr(src, "validities") and callable(src.validities):
+            return src.validities()
+        return validities_from_calibconst(self.calibconst())
+
+    @property
+    def pin(self):
+        """The :class:`Pin` the constants were taken for, or ``None``.  Falls
+        back to a wrapped snapshot's ``pin_obj``."""
+        if self._pin is not None:
+            return self._pin
+        po = getattr(self.source, "pin_obj", None)
+        return po
+
+    @property
+    def det_type_hint(self):
+        """The detector-type/name string the constants name themselves with
+        (for :func:`pscalib.registry.detector_type_of` to normalize), or
+        ``None``."""
+        return detector_type_hint(self.source)
+
+    def __repr__(self):
+        return (f"Constants(source={type(self.source).__name__}, "
+                f"det_type_hint={self.det_type_hint!r}, pin={self.pin})")
 
 
 # ==========================================================================
