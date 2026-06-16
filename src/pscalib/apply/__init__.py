@@ -15,6 +15,11 @@ config=None) -> calib`` registered by detector type in
 """
 
 from . import jungfrau  # noqa: F401
+from . import epix10ka  # noqa: F401
 from .jungfrau import calib_jungfrau
+from .epix10ka import calib_epix10ka, mask_from_pixel_status
 
-__all__ = ["jungfrau", "calib_jungfrau"]
+__all__ = [
+    "jungfrau", "calib_jungfrau",
+    "epix10ka", "calib_epix10ka", "mask_from_pixel_status",
+]

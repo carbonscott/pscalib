@@ -62,8 +62,10 @@ from . import geometry    # noqa: F401
 from . import image       # noqa: F401
 from . import render      # noqa: F401
 from . import providers   # noqa: F401  (providers.snapshot; webdb is opt-in)
+from . import registry    # noqa: F401  (det_type -> apply plugin dispatch; US-004)
 
 from .apply.jungfrau import calib_jungfrau
+from .apply.epix10ka import calib_epix10ka, mask_from_pixel_status
 from .geometry import (
     pixel_coord_indexes_from_text,
     cache_pixel_indexes_for_snapshot,
@@ -76,13 +78,23 @@ from .providers.snapshot import (
     load_snapshot,
     snapshot_calib,
 )
+from .registry import (
+    calib,
+    register,
+    get_plugin,
+    registered_types,
+    detector_type_of,
+)
 
 __all__ = [
-    "apply", "geometry", "image", "render", "providers", "model",
+    "apply", "geometry", "image", "render", "providers", "model", "registry",
     "FORBIDDEN_MODULES", "assert_no_framework_imports",
     "StaleConstantsError", "Validity", "Pin", "check_validity",
     "validities_from_calibconst",
     "calib_jungfrau",
+    "calib_epix10ka", "mask_from_pixel_status",
+    "registry", "calib", "register", "get_plugin", "registered_types",
+    "detector_type_of",
     "pixel_coord_indexes_from_text", "cache_pixel_indexes_for_snapshot",
     "load_pixel_indexes",
     "assemble_image",
