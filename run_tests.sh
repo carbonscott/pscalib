@@ -39,11 +39,12 @@ TESTS=("$@")
 if [[ ${#TESTS[@]} -eq 0 ]]; then
   TESTS=(
     "$REPO/tests/test_calib_us000.py"
-    "$REPO/tests/test_no_drift_us000.py"
     "$REPO/tests/test_webdb_us001.py"
     "$REPO/tests/test_validity_us002.py"
     "$REPO/tests/test_epix10ka_us004.py"
     "$REPO/tests/test_api_us005.py"
+    "$REPO/tests/test_geometry_us006.py"
+    "$REPO/tests/test_purity_us007.py"
   )
 fi
 
