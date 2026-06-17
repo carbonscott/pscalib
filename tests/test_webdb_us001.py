@@ -31,6 +31,7 @@ import subprocess
 import sys
 
 import numpy as np
+import pytest
 
 # --- locate the pscalib package (parent of this tests dir) ------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -126,6 +127,14 @@ def _uniqueid_via_psana():
     myrun = next(ds.runs())
     det = myrun.Detector(DET)
     return det.raw._uniqueid
+
+
+@pytest.fixture
+def uniqueid():
+    """Under pytest, supply the same ``det.raw._uniqueid`` the ``__main__``
+    runner passes to ``test_webdb_import_purity_subprocess`` (computed via
+    psana for this module's EXP/RUN/DET)."""
+    return _uniqueid_via_psana()
 
 
 def test_webdb_import_purity_subprocess(uniqueid):

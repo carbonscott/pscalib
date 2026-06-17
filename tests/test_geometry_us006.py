@@ -33,6 +33,7 @@ import subprocess
 import sys
 
 import numpy as np
+import pytest
 
 # -- jungfrau reference dataset --------------------------------------------
 JF_EXP = "mfx100848724"
@@ -188,6 +189,15 @@ def test_render_via_vendored_derivation(out_dir):
     print("[render via vendored derivation] derived ix/iy == "
           "det.raw._pixel_coord_indexes() (byte-exact)")
     return snap_dir
+
+
+@pytest.fixture
+def snap_dir(out_dir):
+    """Under pytest, supply the populated snapshot directory that the
+    ``__main__`` runner builds via ``test_render_via_vendored_derivation`` and
+    hands to ``test_derive_render_purity_subprocess``. Returns the snap_dir
+    path (or ``None`` when psana is absent, which the purity test skips on)."""
+    return test_render_via_vendored_derivation(out_dir)
 
 
 # --------------------------------------------------------------------------
