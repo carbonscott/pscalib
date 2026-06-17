@@ -244,7 +244,7 @@ def test_jungfrau_gate_and_cross_provider(out_dir):
                                       detname=JF["det"])
     pgeo.cache_pixel_indexes_for_snapshot(snap_dir)
     snap = ps_snap.load_snapshot(snap_dir)
-    imager = pscalib.HDRImager(snap, derive_geometry_if_missing=False)
+    imager = pscalib.Imager(snap, derive_geometry_if_missing=False)
 
     # --- jungfrau byte-exact through the INFERRED public surface ------------
     my_calib = pscalib.calib(gt_raw, snap)            # det_type inferred

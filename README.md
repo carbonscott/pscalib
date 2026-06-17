@@ -31,13 +31,13 @@ src/pscalib/
   _purity.py             # the shared import-purity rule (FORBIDDEN_MODULES)
   registry.py            # pscalib.calib(...) dispatch: det_type -> apply plugin
   model.py               # Constants contract + Pin + Validity + staleness check
-  apply/jungfrau.py      # Jungfrau 3-gain HDR gain decode (== det.raw.calib)
+  apply/jungfrau.py      # Jungfrau 3-gain calibration (== det.raw.calib)
   apply/epix10ka.py      # epix10ka 7-gain-range decode (config-driven)
   providers/snapshot.py  # capture (lazy psana) + numpy reload of constants
   providers/webdb.py     # requests-only web-DB client (the `web` extra)
   geometry.py            # geometry text -> per-pixel image index maps
   image.py               # pixel-array -> 2-D image remap (== det.raw.image)
-  render.py              # HDRImager: raw -> calib -> image, fully offline
+  render.py              # Imager: raw -> calib -> image, fully offline
 ```
 
 - **Core dependency: `numpy` only**, plus the numpy-only `psdata` package (used
@@ -48,13 +48,13 @@ src/pscalib/
   conda build (sourced via `psconda.sh`), not a pip/uv-installable package, and
   is needed only to *regenerate ground truth* / take the one-time snapshot.
 
-## Quickstart — offline calibrated HDR render (US-000)
+## Quickstart — offline calibrated render (US-000)
 
 ```python
-from pscalib import load_snapshot, HDRImager   # pure numpy, no psana
+from pscalib import load_snapshot, Imager   # pure numpy, no psana
 
 snap   = load_snapshot("snapshots/jungfrau_r0051")   # reload pinned constants
-imager = HDRImager(snap)                             # offline render engine
+imager = Imager(snap)                               # offline render engine
 calib, image = imager.render(raw_stack)             # numpy only
 #   calib  (32,512,1024) f32  == det.raw.calib(evt)   (max|diff| == 0)
 #   image  (4216,4432)  f32   == det.raw.image(evt)   (max|diff| == 0)
@@ -171,12 +171,12 @@ but never `pymongo` (reads go over HTTP, never a Mongo socket).
 
 `pscalib` **depends on** the numpy-only `psdata` package; it does **not** depend
 on psana. US-000 **lifts** psdata's already-byte-exact `calib/snapshot.py` +
-`hdr/{jungfrau,geometry,image,render}.py` into `pscalib` as the **canonical
-home**.
+`{jungfrau,geometry,image,render}.py` calibration/assembly modules into
+`pscalib` as the **canonical home**.
 
 psdata's copies are **retained** (psdata is under active development — not
-deleted), but to avoid two independently-editable copies, **psdata's `calib` and
-`hdr` modules are a re-export shim of `pscalib`** (chosen option (a)). There is
+deleted), but to avoid two independently-editable copies, **psdata's calibration
+modules are a re-export shim of `pscalib`** (chosen option (a)). There is
 exactly one implementation of each function/class object — drift is structurally
 impossible, and `tests/test_no_drift_us000.py` proves it by *identity* (the
 psdata symbols `is` the pscalib symbols). The shim requires `pscalib` to be
@@ -205,7 +205,7 @@ non-regression checks skip cleanly (with a message) when psana is not importable
 The acceptance tests regenerate psana ground truth themselves from these
 (constants live in the tests, never in the library):
 
-- **Jungfrau (HDR, 3-gain auto-ranging):** `exp=mfx100848724 run=51
+- **Jungfrau (auto-ranging, 3-gain):** `exp=mfx100848724 run=51
   dir=/sdf/data/lcls/ds/prj/public01/xtc det='jungfrau'` — raw `(32,512,1024)u16`;
   calib `(32,512,1024)f32`; image `(4216,4432)f32`;
   pedestals/pixel_gain/pixel_offset `(3,32,512,1024)f32`. Gain stage is in the raw

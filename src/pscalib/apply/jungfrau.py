@@ -1,4 +1,4 @@
-"""pscalib.apply.jungfrau -- Jungfrau 3-gain HDR gain decode (vendored numpy).
+"""pscalib.apply.jungfrau -- Jungfrau 3-gain calibration (vendored numpy).
 
 The per-detector-type gain-decode leaf of the pure-numpy apply engine.  A
 faithful, framework-free numpy re-implementation of psana's
@@ -8,11 +8,11 @@ segments, exactly as ``calib_jungfrau`` does), verified byte-identical
 dataset (exp=mfx100848724, run=51, det='jungfrau').
 
 This is the canonical home of the Jungfrau decode -- it was first proven in
-psdata's ``hdr/jungfrau.py``, which now re-exports from here.
+psdata's calibration layer, which now re-exports from here.
 
-The Jungfrau is an *auto-ranging* detector: every 16-bit raw word carries its
-own gain stage in the top 2 bits and a 14-bit ADC code in the low 14 bits.
-The three gain stages (the "HDR signature") are the leading ``3`` axis of the
+The Jungfrau is an *auto-ranging (3-gain)* detector: every 16-bit raw word
+carries its own gain stage in the top 2 bits and a 14-bit ADC code in the low
+14 bits.  The three gain stages are the leading ``3`` axis of the
 ``pedestals`` / ``pixel_gain`` / ``pixel_offset`` constants.
 
 Gain-bit decode (psana ``calib_jungfrau_single_panel`` + constants ``MSK``/``BSH``
@@ -39,7 +39,8 @@ MSK = 0x3fff
 #: Gain-bit shift -- psana ``UtilsJungfrau.BSH`` (the gain code is ``raw >> 14``).
 BSH = 14
 
-#: Expected number of gain stages on the leading constant axis (HDR signature).
+#: Expected number of gain stages on the leading constant axis (auto-ranging
+#: 3-gain detector).
 N_GAIN_STAGES = 3
 
 
@@ -129,7 +130,7 @@ def gain_stage_map(raw):
 
     Convenience/introspection helper (not used by :func:`calib_jungfrau`,
     which decodes inline).  ``stage`` is the index into the leading 3-axis of
-    the HDR constants; ``bad`` marks the ``gbits == 2`` code that has no stage.
+    the gain constants; ``bad`` marks the ``gbits == 2`` code that has no stage.
 
     Returns
     -------

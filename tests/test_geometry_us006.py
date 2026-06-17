@@ -168,7 +168,7 @@ def test_render_via_vendored_derivation(out_dir):
     snap = ps_snap.load_snapshot(snap_dir)
     assert snap.geometry is not None, "snapshot must carry geometry text"
     # derive_geometry_if_missing=True -> the VENDORED derivation runs here.
-    imager = pscalib.HDRImager(snap, derive_geometry_if_missing=True)
+    imager = pscalib.Imager(snap, derive_geometry_if_missing=True)
 
     my_calib = imager.calib(gt_raw)
     my_image = imager.image(my_calib)
@@ -213,7 +213,7 @@ snap = ps_snap.load_snapshot(snap_dir)
 ix, iy = pgeo.pixel_coord_indexes_from_text(snap.geometry, do_tilt=True, cframe=0)
 assert ix.shape == iy.shape
 # ... and render through the derive-if-missing path
-imager = pscalib.HDRImager(snap, derive_geometry_if_missing=True)
+imager = pscalib.Imager(snap, derive_geometry_if_missing=True)
 calib = imager.calib(np.zeros((32, 512, 1024), dtype=np.uint16))
 image = imager.image(calib)
 assert image.shape == (4216, 4432), image.shape

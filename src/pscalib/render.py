@@ -1,4 +1,4 @@
-"""pscalib.render -- standalone offline calibrated 2-D HDR image render.
+"""pscalib.render -- standalone offline calibrated 2-D image render.
 
 Ties together a per-detector gain decode (:mod:`pscalib.apply`), the vendored
 image remap (:mod:`pscalib.image`), and a calibration snapshot
@@ -17,7 +17,7 @@ psana-touching step is the one-time snapshot + index-map prep
 (:func:`pscalib.providers.snapshot.snapshot_calib` + :mod:`pscalib.geometry`).
 
 The render is per-detector-type (the gain decode and geometry differ by
-detector).  Today only Jungfrau is wired in; :class:`HDRImager` dispatches on
+detector).  Today only Jungfrau is wired in; :class:`Imager` dispatches on
 ``snapshot.detname`` so other detector types can be added without changing the
 public surface.  (US-004/US-005 generalise this to a detector registry; US-000
 preserves the lifted jungfrau-only dispatch verbatim.)
@@ -42,12 +42,12 @@ def _decoder_for(detname):
         if key.startswith(name):
             return fn
     raise NotImplementedError(
-        f"no HDR gain decode wired in for detector {detname!r}; "
+        f"no gain decode wired in for detector {detname!r}; "
         f"supported: {sorted(_GAIN_DECODERS)}")
 
 
-class HDRImager:
-    """Offline calibrated 2-D HDR image renderer pinned to one calib snapshot.
+class Imager:
+    """Offline calibrated 2-D image renderer pinned to one calib snapshot.
 
     Construct from a :class:`pscalib.providers.snapshot.CalibSnapshot`.  All
     inputs -- constants, mask, geometry index maps -- come from the snapshot, so
@@ -192,13 +192,13 @@ class HDRImager:
         return calib, image
 
     def __repr__(self):
-        return (f"HDRImager(detname={self.detname!r}, run={self.run}, "
+        return (f"Imager(detname={self.detname!r}, run={self.run}, "
                 f"image_shape=({self._rc_tot_max[0] + 1},"
                 f"{self._rc_tot_max[1] + 1}))")
 
 
 def from_snapshot_dir(snap_dir, **kwa):
-    """Build an :class:`HDRImager` from a calib snapshot *directory* path.
+    """Build an :class:`Imager` from a calib snapshot *directory* path.
 
     Loads the snapshot with
     :func:`pscalib.providers.snapshot.load_snapshot` (pure numpy) then
@@ -206,4 +206,12 @@ def from_snapshot_dir(snap_dir, **kwa):
     disk" case.
     """
     from .providers.snapshot import load_snapshot
-    return HDRImager(load_snapshot(snap_dir), **kwa)
+    return Imager(load_snapshot(snap_dir), **kwa)
+
+
+#: Deprecated back-compat alias for :class:`Imager`.  The old name carried the
+#: misnomer "HDR" (high dynamic range), which names no distinct operation -- the
+#: pipeline is just gain-decode calibration + geometry assembly.  Kept so
+#: existing ``from pscalib.render import HDRImager`` callers keep working; prefer
+#: :class:`Imager` in new code.
+HDRImager = Imager

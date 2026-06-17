@@ -16,8 +16,8 @@ their four neighbours (``fillholes=True``).
 
 Verified ``np.array_equal`` to ``det.raw.image(evt)`` for the reference
 Jungfrau dataset (image shape ``(4216, 4432)`` f32).  This is the canonical
-home of the image remap (first proven in psdata's ``hdr/image.py``, which now
-re-exports from here).
+home of the image remap (first proven in psdata's image-assembly layer, which
+now re-exports from here).
 """
 
 import numpy as np

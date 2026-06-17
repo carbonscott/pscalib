@@ -14,28 +14,28 @@ needs ``requests`` + ``bson`` (the ``web`` extra) and is imported explicitly
 Layout (US-000 establishes the offline engine; later stories fill the rest)::
 
     pscalib/
-      apply/jungfrau.py       # Jungfrau 3-gain HDR gain decode (== det.raw.calib)
+      apply/jungfrau.py       # Jungfrau 3-gain calibration (== det.raw.calib)
       apply/epix10ka.py       # NEW (US-004)
       providers/snapshot.py   # capture (lazy psana) + numpy reload of constants
       providers/webdb.py      # NEW (US-001): requests-only web-DB client
       geometry.py             # geometry text -> per-pixel image index maps
       image.py                # pixel-array -> 2-D image remap (== det.raw.image)
-      render.py               # HDRImager: raw -> calib -> image, fully offline
+      render.py               # Imager: raw -> calib -> image, fully offline
       model.py                # NEW (US-001/US-002): Constants / Pin / Validity
       registry.py             # NEW (US-004/US-005): det_type -> apply plugin
 
 The offline calibration engine (US-000), lifted from psdata's already
-byte-exact ``calib`` + ``hdr`` layers::
+byte-exact calibration + image-assembly layers::
 
     from pscalib.providers.snapshot import load_snapshot   # pure numpy
-    from pscalib.render import HDRImager                   # pure numpy
+    from pscalib.render import Imager                      # pure numpy
 
     snap   = load_snapshot("snapshots/jungfrau_r0051")     # reload constants
-    imager = HDRImager(snap)                               # offline render engine
+    imager = Imager(snap)                                  # offline render engine
     calib, image = imager.render(raw_stack)               # numpy only
 
 This package retains its own canonical copy of the calibration engine; psdata's
-``calib``/``hdr`` modules re-export from here (one canonical implementation, no
+calibration modules re-export from here (one canonical implementation, no
 drift).  See the README "psdata relationship" section.
 """
 
@@ -74,7 +74,7 @@ from .geometry import (
     load_pixel_indexes,
 )
 from .image import assemble_image
-from .render import HDRImager, from_snapshot_dir
+from .render import Imager, HDRImager, from_snapshot_dir
 from .providers.snapshot import (
     CalibSnapshot,
     load_snapshot,
@@ -101,6 +101,6 @@ __all__ = [
     "pixel_coord_indexes_from_text", "cache_pixel_indexes_for_snapshot",
     "load_pixel_indexes",
     "assemble_image",
-    "HDRImager", "from_snapshot_dir",
+    "Imager", "HDRImager", "from_snapshot_dir",
     "CalibSnapshot", "load_snapshot", "snapshot_calib",
 ]

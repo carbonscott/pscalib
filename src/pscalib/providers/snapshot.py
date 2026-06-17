@@ -20,7 +20,7 @@ On-disk layout (one directory per ``(detector, run)`` pin)::
 
     <detname>_r<run:04d>/
         manifest.json        # pin + per-ctype validity metadata + index
-        pedestals.npy        # (3,32,512,1024) f32   ] the HDR calibration
+        pedestals.npy        # (3,32,512,1024) f32   ] the gain calibration
         pixel_gain.npy       # (3,32,512,1024) f32   ] constants -- leading
         pixel_offset.npy     # (3,32,512,1024) f32   ] axis = 3 gain stages
         pixel_status.npy     # (3,32,512,1024) u64   ] (+ pixel_rms/max/min ...)
@@ -108,7 +108,7 @@ class CalibSnapshot:
         self.run = pin["run"]
         self.exp = pin.get("exp")
 
-    # -- the named HDR constants ------------------------------------------
+    # -- the named gain-calibration constants -----------------------------
     @property
     def pedestals(self):
         """``(3,32,512,1024) f32`` pedestals (leading axis = 3 gain stages)."""
@@ -197,7 +197,7 @@ class CalibSnapshot:
 
         This is the byte-for-byte inverse of what :func:`snapshot_calib`
         captured, so feeding it where psana's ``_calibconst`` is expected (e.g.
-        the HDR render) reproduces psana's exact arrays.
+        the calibrated render) reproduces psana's exact arrays.
         """
         out = {}
         for ctype in self.ctypes():

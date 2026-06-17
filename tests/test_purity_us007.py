@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """US-007 acceptance test: the import-purity guard prefix-matches ``psana.*``.
 
-CONTEXT (2026-06-16 dependency/HDR audit).  ``assert_no_framework_imports()``
+CONTEXT (2026-06-16 dependency audit).  ``assert_no_framework_imports()``
 underwrites the whole project's "no framework" guarantee, but it used to match
 forbidden modules by EXACT name (``m in sys.modules``).  The real compiled xtc2
 reader is the SUBMODULE ``psana.dgram`` -- it lands in ``sys.modules`` under the

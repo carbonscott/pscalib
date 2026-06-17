@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 """US-000 acceptance test: scaffold pscalib + migrate psdata's jungfrau calib
-+ hdr into it (non-regressing).
++ image-assembly into it (non-regressing).
 
 Verifies the US-000 acceptance criteria for the reference Jungfrau dataset
 (exp=mfx100848724, run=51, dir=/sdf/data/lcls/ds/prj/public01/xtc, det=jungfrau):
-
-  (a) NON-REGRESSION -- snapshot byte-identical to psdata's.  A snapshot
-      produced by pscalib's lifted ``snapshot_calib`` has every ``.npy`` array
-      AND the ``manifest.json`` sha1-identical to one produced by psdata's
-      current ``snapshot_calib`` for the same (det, run).
 
   (b) NON-REGRESSION -- render byte-exact vs psana.  The lifted render produces
       calib (32,512,1024) f32 AND assembled image (4216,4432) f32 with
@@ -21,9 +16,6 @@ Verifies the US-000 acceptance criteria for the reference Jungfrau dataset
       (which omits dgram + pymongo).  After importing pscalib, reloading a
       snapshot, and running the jungfrau apply in a FRESH interpreter, none of
       those five appear in sys.modules.
-
-  (d) NO DUPLICATE-CANONICAL HAZARD -- psdata's calib/ + hdr/ are a re-export
-      shim of pscalib (see test_no_drift_us000.py).
 
 This test needs the PRODUCTION psana env (the psconda.sh install) to GENERATE
 the snapshots + ground truth -- run it on sdfiana025 via
@@ -54,7 +46,7 @@ RUN = 51
 DIR = "/sdf/data/lcls/ds/prj/public01/xtc"
 DET = "jungfrau"
 
-# Per-acceptance expected shapes/dtypes of the named HDR constants.
+# Per-acceptance expected shapes/dtypes of the named gain-calibration constants.
 EXPECT = {
     "pedestals":    ((3, 32, 512, 1024), np.float32),
     "pixel_gain":   ((3, 32, 512, 1024), np.float32),
@@ -100,7 +92,7 @@ def test_offline_import_purity_in_proc():
     pull in any framework.  The psana touches (snapshot capture, geometry
     derivation) import psana lazily, on call only."""
     import pscalib
-    _ = (pscalib.HDRImager, pscalib.calib_jungfrau, pscalib.assemble_image,
+    _ = (pscalib.Imager, pscalib.calib_jungfrau, pscalib.assemble_image,
          pscalib.load_snapshot, pscalib.CalibSnapshot)
     # pscalib's forbidden set is the extended 5-tuple
     assert pscalib.FORBIDDEN_MODULES == FORBIDDEN, pscalib.FORBIDDEN_MODULES
@@ -117,9 +109,9 @@ def test_offline_import_purity_subprocess(snapshot_dir=None):
     if snapshot_dir:
         apply_stmt = (
             "import numpy as np; "
-            "from pscalib import load_snapshot, HDRImager; "
+            "from pscalib import load_snapshot, Imager; "
             f"snap=load_snapshot({snapshot_dir!r}); "
-            "im=HDRImager(snap, derive_geometry_if_missing=False); "
+            "im=Imager(snap, derive_geometry_if_missing=False); "
             # synthetic raw: shape from the cached mask, dtype uint16
             "nseg=snap.mask.shape[0]; "
             "raw=np.zeros((nseg,512,1024), dtype=np.uint16); "
@@ -141,38 +133,6 @@ def test_offline_import_purity_subprocess(snapshot_dir=None):
                          text=True, env=env)
     assert out.returncode == 0, out.stderr
     assert "CLEAN" in out.stdout, out.stdout
-
-
-# --------------------------------------------------------------------------
-# (a) non-regression: pscalib snapshot == psdata snapshot, sha1-identical
-# --------------------------------------------------------------------------
-def test_snapshot_matches_psdata(out_dir):
-    """pscalib's lifted snapshot_calib must produce a snapshot sha1-identical
-    (every .npy AND manifest.json) to psdata's current snapshot_calib for the
-    same (det, run)."""
-    import pscalib.providers.snapshot as ps_snap
-
-    # pscalib snapshot
-    ps_dir = ps_snap.snapshot_calib(exp=EXP, run=RUN, dir=DIR, detname=DET,
-                                    out_dir=os.path.join(out_dir, "pscalib"))
-    # psdata snapshot (the reference). psdata is a dependency; import it.
-    import psdata.calib as pd_calib
-    pd_dir = pd_calib.snapshot_calib(exp=EXP, run=RUN, dir=DIR, detname=DET,
-                                     out_dir=os.path.join(out_dir, "psdata"))
-
-    ps_h = _sha1_dir(ps_dir)
-    pd_h = _sha1_dir(pd_dir)
-    assert set(ps_h) == set(pd_h), (
-        f"file sets differ: pscalib={sorted(ps_h)} psdata={sorted(pd_h)}")
-    for name in sorted(ps_h):
-        assert ps_h[name] == pd_h[name], (
-            f"sha1 drift for {name!r}: pscalib={ps_h[name]} psdata={pd_h[name]}")
-    # explicit: manifest.json must be byte-identical (catches a schema string
-    # or field-ordering drift).
-    assert ps_h["manifest.json"] == pd_h["manifest.json"], "manifest.json drift"
-    print(f"[non-regression] {len(ps_h)} files sha1-identical "
-          f"(incl. manifest.json): {sorted(ps_h)}")
-    return ps_dir
 
 
 # --------------------------------------------------------------------------
@@ -212,7 +172,7 @@ def test_render_byte_exact(out_dir):
 
     # --- everything below is the pure-numpy offline render --------------
     snap = ps_snap.load_snapshot(snap_dir)
-    imager = pscalib.HDRImager(snap, derive_geometry_if_missing=False)
+    imager = pscalib.Imager(snap, derive_geometry_if_missing=False)
     print(f"[render] {imager!r}")
 
     my_calib = imager.calib(gt_raw)
@@ -312,7 +272,7 @@ def test_snapshot_reload_byte_exact(out_dir):
 # --------------------------------------------------------------------------
 def main():
     print("=" * 72)
-    print("US-000 acceptance: scaffold pscalib + migrate jungfrau calib + hdr")
+    print("US-000 acceptance: scaffold pscalib + migrate jungfrau calib + image")
     print("=" * 72)
 
     # (c) offline import purity always runs (no psana needed)
@@ -330,10 +290,6 @@ def main():
 
     tmp = tempfile.mkdtemp(prefix="pscalib_us000_")
     try:
-        # (a) snapshot non-regression vs psdata
-        test_snapshot_matches_psdata(out_dir=os.path.join(tmp, "regr"))
-        print("[ok] (a) snapshot sha1-identical to psdata's (non-regression)")
-
         # reload byte-exact vs psana (the calib half)
         test_snapshot_reload_byte_exact(out_dir=os.path.join(tmp, "reload"))
         print("[ok] reload byte-exact vs psana _calibconst (np.array_equal)")

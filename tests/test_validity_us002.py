@@ -17,7 +17,7 @@ Verifies the US-002 acceptance criteria:
         * ``allow_stale=True`` downgrades the refusal to a LOGGED WARNING,
         * an IN-RANGE apply passes SILENTLY.
       All three outcomes are demonstrated observably -- first fully offline
-      (no psana), then on the real jungfrau dataset through ``HDRImager``.
+      (no psana), then on the real jungfrau dataset through ``Imager``.
 
   (3) REGRESSION -- with enforcement satisfied (in-range), the jungfrau apply
       still produces calib (32,512,1024) f32 with max|diff| == 0 vs
@@ -205,7 +205,7 @@ def test_check_validity_three_outcomes():
 def _write_synthetic_snapshot(snap_dir, ped_validity=("end",), run=100):
     """Write a minimal but real pscalib snapshot dir: a (3,1,4,4) pedestals +
     pixel_gain + an (1,4,4) mask, with the given per-ctype validity, so
-    CalibSnapshot.check_validity / HDRImager can exercise enforcement offline."""
+    CalibSnapshot.check_validity / Imager can exercise enforcement offline."""
     os.makedirs(snap_dir, exist_ok=True)
     ped = np.zeros((3, 1, 4, 4), dtype=np.float32)
     gain = np.ones((3, 1, 4, 4), dtype=np.float32)
@@ -302,7 +302,7 @@ def test_jungfrau_inrange_regression_and_enforcement(out_dir):
                                       out_dir=out_dir)
     pgeo.cache_pixel_indexes_for_snapshot(snap_dir)
     snap = ps_snap.load_snapshot(snap_dir)
-    imager = pscalib.HDRImager(snap, derive_geometry_if_missing=False)
+    imager = pscalib.Imager(snap, derive_geometry_if_missing=False)
 
     # the real constants' validity for this run -- the snapshot's pedestals must
     # cover RUN (psana selected them for it), so in-range enforcement must pass.
