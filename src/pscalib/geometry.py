@@ -2,23 +2,23 @@
 
 The pixel-coordinate index maps ``ix, iy`` (mapping each ``(seg, row, col)``
 data pixel to its ``(image_row, image_col)``) are derived from the detector's
-geometry text via psana's pure-numpy ``GeometryAccess`` --
-``GeometryAccess.load_pars_from_str/file`` (~195/223) +
-``get_pixel_coord_indexes(do_tilt=True, cframe=0)`` (~592).  Verified
-byte-identical (``np.array_equal``) to ``det.raw._pixel_coord_indexes()``.
+geometry text via the **vendored** pure-numpy ``GeometryAccess``
+(:mod:`pscalib._geometry`) --
+``GeometryAccess.load_pars_from_str/file`` +
+``get_pixel_coord_indexes(do_tilt=True, cframe=0)``.  Verified byte-identical
+(``np.array_equal``) to ``det.raw._pixel_coord_indexes()``.
 
-This is one of the **two** psana-touching steps in pscalib (the other is the
-snapshot capture in :mod:`pscalib.providers.snapshot`), and it is a
-*prep/snapshot-time* step, not an apply-time one: the resulting ``ix.npy`` /
-``iy.npy`` are run-pinned constants (the geometry is fixed for a run), cached
-once alongside a calibration snapshot.  At render time :mod:`pscalib.image`
-consumes the cached ``ix``/``iy`` with numpy only -- no ``GeometryAccess``, no
-psana.
+This derivation is a *prep/snapshot-time* step, not an apply-time one: the
+resulting ``ix.npy`` / ``iy.npy`` are run-pinned constants (the geometry is
+fixed for a run), cached once alongside a calibration snapshot.  At render time
+:mod:`pscalib.image` consumes the cached ``ix``/``iy`` with numpy only.
 
-``GeometryAccess`` itself is pure numpy, but it lives in the psana tree, so to
-keep ``import pscalib`` framework-free the psana import here is **lazy** -- it
-only happens when you actually derive indexes (a one-time op), exactly
-mirroring :func:`pscalib.providers.snapshot.snapshot_calib`.
+``GeometryAccess`` was vendored into :mod:`pscalib._geometry` (US-006) so that
+deriving the index maps no longer imports psana at all -- the whole apply/render
+path is now framework-free.  The original psana ``GeometryAccess`` was the last
+real psana import on that path; the only remaining lazy psana touch in pscalib
+is the snapshot *capture* in :mod:`pscalib.providers.snapshot` (superseded by
+the webdb provider).
 """
 
 import os
@@ -33,9 +33,10 @@ IY_FILE = "pixel_index_iy.npy"
 def pixel_coord_indexes_from_text(geometry_text, do_tilt=True, cframe=0):
     """Derive ``(ix, iy)`` per-pixel image index maps from geometry text.
 
-    Uses psana's pure-numpy ``GeometryAccess`` (imported lazily).  Run once
-    (in the ``psconda.sh`` psana env) to produce the run-pinned index maps;
-    the result is byte-identical to ``det.raw._pixel_coord_indexes()``.
+    Uses the vendored pure-numpy ``GeometryAccess``
+    (:mod:`pscalib._geometry`, no psana import).  The result is byte-identical
+    to ``det.raw._pixel_coord_indexes()`` (== psana's
+    ``GeometryAccess.get_pixel_coord_indexes(do_tilt=True, cframe=0)``).
 
     Parameters
     ----------
@@ -54,8 +55,10 @@ def pixel_coord_indexes_from_text(geometry_text, do_tilt=True, cframe=0):
         (``(nsegs, 512, 1024)`` for Jungfrau), dtype as psana returns
         (``uint64``).
     """
-    # Lazy psana import: keeps importing pscalib framework-free.
-    from psana.pscalib.geometry.GeometryAccess import GeometryAccess
+    # Vendored numpy-only GeometryAccess (US-006) -- no psana import.  Imported
+    # at call time only to keep ``import pscalib.geometry`` itself trivially
+    # cheap; the chain is pure os/numpy/math/logging.
+    from ._geometry.GeometryAccess import GeometryAccess
 
     geo = GeometryAccess()
     geo.load_pars_from_str(geometry_text)
@@ -69,9 +72,10 @@ def cache_pixel_indexes_for_snapshot(snap_dir, do_tilt=True, cframe=0,
 
     Reads ``geometry.txt`` from the snapshot (written by
     :func:`pscalib.providers.snapshot.snapshot_calib`), derives the index maps
-    with psana's ``GeometryAccess``, and writes :data:`IX_FILE` / :data:`IY_FILE`
-    next to the constants.  This is the one-time, psana-using augmentation that
-    makes the snapshot self-sufficient for a fully-offline render.
+    with the vendored numpy-only ``GeometryAccess`` (no psana), and writes
+    :data:`IX_FILE` / :data:`IY_FILE` next to the constants.  This is the
+    one-time augmentation that makes the snapshot self-sufficient for a
+    fully-offline render.
 
     Parameters
     ----------
@@ -113,7 +117,7 @@ def load_pixel_indexes(snap_dir):
     """Load cached ``(ix, iy)`` index maps from a snapshot dir (pure numpy).
 
     Returns ``None`` if they have not been cached (call
-    :func:`cache_pixel_indexes_for_snapshot` once, with psana, to create them).
+    :func:`cache_pixel_indexes_for_snapshot` once to create them).
     """
     ix_path = os.path.join(snap_dir, IX_FILE)
     iy_path = os.path.join(snap_dir, IY_FILE)

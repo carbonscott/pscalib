@@ -21,14 +21,17 @@ The web retrieval path (US-001) may import ``requests`` and ``bson`` (the
 pure-python ``ObjectId``); those are NOT forbidden.  ``bson`` is a different
 package from ``pymongo`` -- importing ``bson`` does not open a Mongo connection.
 
-psana is permitted only inside two LAZY function-body imports, both one-time
-prep steps run in the psana env, never on the offline/apply path:
+psana is permitted only inside ONE LAZY function-body import, a one-time prep
+step run in the psana env, never on the offline/apply path:
 
   * :func:`pscalib.providers.snapshot.snapshot_calib` -- ``from psana import
     DataSource`` (capture the constants once).
-  * :func:`pscalib.geometry.pixel_coord_indexes_from_text` --
-    ``from psana.pscalib.geometry.GeometryAccess import GeometryAccess``
-    (derive the pixel index maps once).
+
+The geometry pixel-index derivation
+(:func:`pscalib.geometry.pixel_coord_indexes_from_text`) USED to be a second
+lazy psana touch; as of US-006 it uses the vendored numpy-only
+:mod:`pscalib._geometry` closure and imports no psana at all, so the whole
+apply/render path is now framework-free.
 """
 
 import sys
@@ -44,10 +47,10 @@ def assert_no_framework_imports(forbidden=FORBIDDEN_MODULES):
     """Raise ``AssertionError`` if any forbidden module leaked into
     ``sys.modules``.
 
-    The snapshot capture and the one-time geometry derivation import psana
-    lazily *on call*; merely importing pscalib, reloading a snapshot, applying
-    constants, or doing a web fetch must not.  Call this after one of those
-    offline/web operations to assert the path stayed clean.
+    The snapshot capture imports psana lazily *on call*; merely importing
+    pscalib, reloading a snapshot, applying constants, deriving geometry index
+    maps (now vendored, US-006), or doing a web fetch must not.  Call this after
+    one of those offline/web operations to assert the path stayed clean.
     """
     leaked = [m for m in forbidden if m in sys.modules]
     assert not leaked, (

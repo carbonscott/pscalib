@@ -55,8 +55,9 @@ class HDRImager:
 
     The geometry index maps (``ix``/``iy``) are read from the snapshot if they
     were cached (:func:`pscalib.geometry.cache_pixel_indexes_for_snapshot`),
-    else derived once from the snapshot's geometry text via psana's
-    ``GeometryAccess`` (the single lazy psana touch) and cached for next time.
+    else derived once from the snapshot's geometry text via the **vendored**
+    numpy-only ``GeometryAccess`` (:mod:`pscalib._geometry`, no psana, US-006)
+    and cached for next time.
 
     Parameters
     ----------
@@ -64,10 +65,9 @@ class HDRImager:
         A pinned calibration snapshot for the detector + run to render.
     derive_geometry_if_missing : bool
         If the snapshot has no cached ``ix``/``iy`` but does carry geometry
-        text, derive them (one lazy psana ``GeometryAccess`` call) and cache
-        them into the snapshot dir.  Default True.  Set False to force a
-        fully-offline construction that fails fast if the maps were never
-        cached.
+        text, derive them (one vendored numpy-only ``GeometryAccess`` call, no
+        psana) and cache them into the snapshot dir.  Default True.  Set False
+        to force a construction that fails fast if the maps were never cached.
     """
 
     def __init__(self, snapshot, derive_geometry_if_missing=True):
