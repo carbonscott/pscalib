@@ -204,6 +204,17 @@ def plugin_epix10ka(raw, constants, config=None):
             "epix10ka apply requires the per-segment Configure object "
             "(config=run.seg_configs(detname)); it drives the gain-range decode "
             "and is not in the calib DB")
+    # An EMPTY config (e.g. seg_configs returned {} because the per-segment
+    # CONFIGURE-block could not be located) would otherwise fail deep in the
+    # gain decode with an opaque ``np.stack([])`` ("need at least one array to
+    # stack").  Fail here with a diagnosable message instead.
+    if hasattr(config, "__len__") and len(config) == 0:
+        raise ValueError(
+            "epix10ka apply got an EMPTY per-segment config "
+            "(config has no segments).  psdata's run.seg_configs(detname) "
+            "returned nothing -- the detector's CONFIGURE-block (trbit / "
+            "asicPixelConfig) was not found in any front transition dgram, so "
+            "the gain-range decode cannot run.")
     pedestals = _get_const(constants, "pedestals")
     pixel_gain = _get_const(constants, "pixel_gain")
     mask = _get_const(constants, "mask", required=False)
