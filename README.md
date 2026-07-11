@@ -197,8 +197,19 @@ source /sdf/group/lcls/ds/ana/sw/conda2/manage/bin/psconda.sh
 bash run_tests.sh
 ```
 
-The offline import-purity checks run without psana; the byte-exact /
-non-regression checks skip cleanly (with a message) when psana is not importable.
+The offline import-purity checks run without psana. The byte-exact /
+non-regression checks need psana as their oracle: when psana is not importable
+they emit a machine-readable `##SKIP##` marker and `run_tests.sh` turns the
+suite **RED** (an unjustified skip fails the run — a skip is not a pass). This
+is deliberate: psana-absent is an environment fault (usually
+`PYTHONPATH`-clobber — `<repo>/src` ahead of the psana env), not a green run. Do
+**not** "fix" a red psana-absent run by weakening the runner; source
+`psconda.sh` and prepend (never replace) `PYTHONPATH`. The runner prints a
+`N passed, M failed, S skipped` tally, fails on any unjustified or unrouted skip
+(and on an empty suite), and its default list is checked against
+`tests/test_*.py` on disk so no test can silently go unrun (`bash run_tests.sh
+--list` shows the resolved suite). The only skips it forgives are those listed,
+with justification, in `tests/skips_allowed.txt`.
 
 ## Reference datasets
 

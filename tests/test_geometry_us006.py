@@ -35,6 +35,13 @@ import sys
 import numpy as np
 import pytest
 
+# --- machine-readable skip protocol + fresh scratch dirs (HYG-05) ----------
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from _outdir import cleanup_out_dir, make_out_dir  # noqa: E402
+from _skips import skip  # noqa: E402
+
 # -- jungfrau reference dataset --------------------------------------------
 JF_EXP = "mfx100848724"
 JF_RUN = 51
@@ -118,7 +125,10 @@ def _check_derivation_byte_exact(exp, run, det, det_dir, label):
 def test_vendored_derivation_byte_exact_jungfrau():
     """Vendored derivation == psana for jungfrau, same text + kwargs."""
     if not _have_psana():
-        print("SKIP test_vendored_derivation_byte_exact_jungfrau: no psana")
+        skip("us006_derivation_byte_exact_jungfrau_no_psana",
+             "psana not importable -- cannot generate the GeometryAccess "
+             "ground truth, so the jungfrau byte-exact derivation gate did NOT "
+             "run. Source psconda.sh on sdfiana025.")
         return
     _check_derivation_byte_exact(JF_EXP, JF_RUN, JF_DET, JF_DIR, "jungfrau")
 
@@ -126,7 +136,10 @@ def test_vendored_derivation_byte_exact_jungfrau():
 def test_vendored_derivation_byte_exact_epix10ka():
     """Vendored derivation == psana for epix10ka, same text + kwargs."""
     if not _have_psana():
-        print("SKIP test_vendored_derivation_byte_exact_epix10ka: no psana")
+        skip("us006_derivation_byte_exact_epix10ka_no_psana",
+             "psana not importable -- cannot generate the GeometryAccess "
+             "ground truth, so the epix10ka byte-exact derivation gate did NOT "
+             "run. Source psconda.sh on sdfiana025.")
         return
     _check_derivation_byte_exact(EP_EXP, EP_RUN, EP_DET, EP_DIR, "epix10ka")
 
@@ -139,7 +152,10 @@ def test_render_via_vendored_derivation(out_dir):
     jungfrau render assembles the (4216,4432) f32 image byte-exact vs psana --
     proving the vendored derivation path drives the renderer end-to-end."""
     if not _have_psana():
-        print("SKIP test_render_via_vendored_derivation: no psana")
+        skip("us006_render_via_vendored_derivation_no_psana",
+             "psana not importable -- cannot produce det.raw.image(evt) ground "
+             "truth, so the end-to-end derive-and-render byte-exact gate did "
+             "NOT run. Source psconda.sh on sdfiana025.")
         return
     import pscalib
     import pscalib.providers.snapshot as ps_snap
@@ -239,7 +255,10 @@ def test_derive_render_purity_subprocess(snap_dir):
     """Fresh interpreter: derive ix/iy from geometry text + render, then assert
     none of the forbidden framework modules are in sys.modules."""
     if snap_dir is None:
-        print("SKIP test_derive_render_purity_subprocess: no snapshot dir")
+        skip("us006_derive_render_purity_no_snapshot_dir",
+             "no snapshot dir -- the psana-dependent render step above did not "
+             "produce one (psana not importable), so the fresh-interpreter "
+             "derive+render purity probe did NOT run.")
         return
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     src = os.path.join(repo, "src")
@@ -263,13 +282,26 @@ def test_derive_render_purity_subprocess(snap_dir):
 
 
 def main():
-    out_dir = os.environ.get("PSCALIB_TEST_OUT", "/tmp/pscalib_us006_out")
-    os.makedirs(out_dir, exist_ok=True)
-
-    test_vendored_derivation_byte_exact_jungfrau()
-    test_vendored_derivation_byte_exact_epix10ka()
-    snap_dir = test_render_via_vendored_derivation(out_dir)
-    test_derive_render_purity_subprocess(snap_dir)
+    # HYG-05 idempotency: this used to be a FIXED path
+    # (os.environ.get("PSCALIB_TEST_OUT", "/tmp/pscalib_us006_out") + makedirs
+    # exist_ok=True). snapshot_calib() defaults to overwrite=False and raises
+    # FileExistsError on a non-empty snapshot dir, so the first run populated
+    # <out>/jungfrau_r0051/ and EVERY subsequent run died there -- unless a
+    # human first ran `rm -rf /tmp/pscalib_us006_out` by hand. A suite that only
+    # passes on a clean machine is not a suite.
+    #
+    # make_out_dir() hands back a FRESH, EMPTY directory every single call, so
+    # the run can never collide with its own leftovers. Note we do NOT reach for
+    # overwrite=True: that would paper over the collision by disarming the very
+    # guard snapshot_calib exists to provide.
+    out_dir = make_out_dir("pscalib_us006")
+    try:
+        test_vendored_derivation_byte_exact_jungfrau()
+        test_vendored_derivation_byte_exact_epix10ka()
+        snap_dir = test_render_via_vendored_derivation(out_dir)
+        test_derive_render_purity_subprocess(snap_dir)
+    finally:
+        cleanup_out_dir(out_dir)
 
     print("\nALL US-006 ACCEPTANCE CHECKS PASSED")
 
