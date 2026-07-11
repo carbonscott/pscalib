@@ -145,12 +145,25 @@ class Validity:
         return cls(meta["run"], meta.get("run_end", "end"))
 
     def contains(self, run):
-        """True iff ``run`` falls within ``[run, run_end]`` (inclusive).
+        """True iff ``run`` falls within this validity range.
 
-        Same test as psana ``select_doc_in_run_range``: ``begin <= rnum <= end``.
+        Same test as psana ``select_doc_in_run_range``: ``begin <= rnum <= end``,
+        *inclusive at both bounds* -- a run **equal** to :attr:`run_end` is still
+        valid, and forward-expiry fires only for ``run > run_end`` (CAL-12).
+
+        The ``'end'`` sentinel is *open-ended*: an :attr:`open_ended` range never
+        expires forward, so it contains every ``run >= self.run`` -- including
+        runs beyond :data:`RUN_MAX`.  Its :attr:`run_end` is pinned to
+        :data:`RUN_MAX` only as a *representation* of "no upper bound"; comparing
+        against that numeric cap instead of consulting :attr:`open_ended` would
+        falsely expire a never-expiring constant for a run above the cap (the
+        CAL-12 forward-expiry defect -- the ``'end'`` sentinel must be honored as
+        unbounded, not mis-compared as the number 9999).
         """
         run = int(run)
-        return self.run <= run <= self.run_end
+        if run < self.run:
+            return False
+        return self.open_ended or run <= self.run_end
 
     def as_dict(self):
         """Return ``{'run', 'run_end'}`` with ``run_end`` re-encoded as the
