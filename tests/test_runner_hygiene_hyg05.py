@@ -63,15 +63,18 @@ _OLD_FIXED_DIR = "/tmp/pscalib_us006_out"
 # helpers
 # ---------------------------------------------------------------------------
 def _mask(text):
-    """Neutralise skip markers before we ever print captured output.
+    """Neutralise skip markers/idioms before we ever print captured output.
 
     This test file is itself part of the default suite, so it runs *inside*
     run_tests.sh. If we echoed a probe's raw output (or let an assertion message
     carry it into a traceback), the OUTER runner would grep our stdout, find a
-    marker we merely quoted, and count a phantom skip. Everything we print or
-    embed in an assertion goes through here first.
+    marker (or a bare `[skip]`/`SKIPPED` line) we merely quoted, and count a
+    phantom skip. Everything we print or embed in an assertion goes through here
+    first, so a hygiene FAILURE never pollutes the outer runner's skip scan.
     """
-    return text.replace(SKIP_MARKER, "<SKIP-MARKER>")
+    text = text.replace(SKIP_MARKER, "<SKIP-MARKER>")
+    return re.sub(r"\[skip\]|skipping|skipped", "<skip-idiom>", text,
+                  flags=re.IGNORECASE)
 
 
 def _write_probe(dirpath, name, body):
@@ -94,6 +97,16 @@ def _skip_probe(slug, reason="synthetic probe: pretending an oracle is absent"):
 
 _PASS_PROBE = "import sys\nprint('probe: nothing to report')\nsys.exit(0)\n"
 _FAIL_PROBE = "import sys\nprint('probe: deliberate failure')\nsys.exit(3)\n"
+
+# The pre-fix bug pattern in its purest form: a probe that ANNOUNCES a skip the
+# OLD way and exits 0, emitting NO ##SKIP## marker. Built from concatenated
+# fragments so this source file itself carries no literal "[skip]" token that a
+# scanner (ours or a reviewer's) could mistake for a real one.
+_BARE_SKIP_PROBE = (
+    "import sys\n"
+    "print('[' + 'skip' + '] no psana -- old idiom, exits 0, no marker')\n"
+    "sys.exit(0)\n"
+)
 
 
 def _run_runner(args, cwd=None):
@@ -155,6 +168,38 @@ def test_unlisted_skip_fails_the_run():
     print("[hyg05] an unlisted skip turns the suite RED (exit != 0)")
 
 
+def test_bare_unrouted_skip_line_fails_the_run():
+    """A probe that prints an OLD-idiom skip line and exits 0 -- with NO
+    ##SKIP## marker -- must turn the suite RED.
+
+    This is the THIRD discriminator. The marker protocol only meters skips that
+    route through skip(); a bare `print("[skip] ...") ; return` bypasses it
+    entirely. On the parent commit (and on a fix that only counted markers) such
+    a probe exits 0 and scores a silent PASS -- the very bug pattern this ticket
+    exists to kill. The runner must scan the captured logs for the idiom and
+    fail.
+    """
+    tmp = tempfile.mkdtemp(prefix="hyg05_bare_")
+    try:
+        probe = _write_probe(tmp, "probe_bare_skip.py", _BARE_SKIP_PROBE)
+        rc, out = _run_runner([probe])
+
+        assert rc != 0, (
+            "runner exited 0 on a bare unrouted skip line (old idiom, no "
+            "marker) -- the skip protocol can be bypassed by simply not using "
+            "it (HYG-05). Output:\n" + _mask(out))
+        assert "UNJUSTIFIED SKIP: <unrouted>" in out, (
+            "runner did not flag the unrouted skip as unjustified. Output:\n"
+            + _mask(out))
+        # And it must point the author at the fix.
+        assert "skip(name, reason)" in out, (
+            "runner did not tell the author to route the skip through "
+            "skip(name, reason). Output:\n" + _mask(out))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("[hyg05] a printed skip-idiom that bypasses skip() turns the suite RED")
+
+
 def test_summary_reports_an_explicit_skip_count():
     """The summary must tally passed/failed/SKIPPED explicitly, every run."""
     tmp = tempfile.mkdtemp(prefix="hyg05_summary_")
@@ -182,7 +227,10 @@ def test_summary_reports_an_explicit_skip_count():
             "skip was scored as a pass. Output:\n" + _mask(out))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    print("[hyg05] summary carries an explicit passed/failed/skipped tally")
+    # NOTE: this line runs INSIDE the full suite, so its own text must not read
+    # as an unrouted skip to the runner's bare-skip scan -- keep it free of the
+    # literal idiom words "[skip]"/"skipping"/"skipped".
+    print("[hyg05] summary carries an explicit passed / failed / skip tally")
 
 
 def test_failing_test_is_counted_and_reddens_the_run():
@@ -384,6 +432,45 @@ def test_suite_is_idempotent_across_back_to_back_runs():
     print("[hyg05] the runner is idempotent: two runs back to back, no cleanup")
 
 
+def test_empty_suite_is_not_green():
+    """A run that executes 0 tests must FAIL, not pass.
+
+    If the manifest and tests/test_*.py were both empty, `0 passed, 0 failed,
+    0 skipped` would otherwise satisfy the exit-0 condition -- a green light for
+    a suite that proved nothing. The real manifest is non-empty (so its
+    integrity check would reject an empty tests dir before we ever reach the
+    guard), so we prove the guard EXECUTABLY on a sandbox copy of the runner
+    whose MANIFEST has been emptied, pointed at an empty tests dir.
+    """
+    with open(_RUNNER) as fh:
+        src = fh.read()
+    # Empty the MANIFEST=( ... ) array in the copy (first block, up to a lone ')').
+    sandbox_src, nsub = re.subn(r"MANIFEST=\(.*?\n\)", "MANIFEST=()", src,
+                                count=1, flags=re.DOTALL)
+    assert nsub == 1, "could not locate the MANIFEST=(...) block to empty it"
+
+    tmp = tempfile.mkdtemp(prefix="hyg05_empty_")
+    try:
+        runner = os.path.join(tmp, "run_tests.sh")
+        with open(runner, "w") as fh:
+            fh.write(sandbox_src)
+        os.makedirs(os.path.join(tmp, "tests"))          # empty: no test_*.py
+        os.makedirs(os.path.join(tmp, "src"))            # silence PYTHONPATH warn
+        proc = subprocess.run(["bash", runner],
+                              cwd=tempfile.gettempdir(),
+                              capture_output=True, text=True)
+        out = proc.stdout + proc.stderr
+        assert proc.returncode != 0, (
+            "empty suite (0 tests) exited 0 -- a suite that ran nothing was "
+            "called green (HYG-05). Output:\n" + _mask(out))
+        assert "ran 0 tests" in out, (
+            "empty-suite failure did not say 'ran 0 tests'. Output:\n"
+            + _mask(out))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("[hyg05] empty suite (0 tests) is RED, not green -- ran 0 tests => FAIL")
+
+
 def main():
     print("=" * 72)
     print("HYG-05 acceptance: run_tests.sh is a meter (tally + skips + "
@@ -391,6 +478,7 @@ def main():
     print("=" * 72)
 
     test_unlisted_skip_fails_the_run()
+    test_bare_unrouted_skip_line_fails_the_run()
     test_summary_reports_an_explicit_skip_count()
     test_failing_test_is_counted_and_reddens_the_run()
     test_allowlisted_skip_is_forgiven()
@@ -399,6 +487,7 @@ def main():
     test_scratch_dirs_are_fresh_every_run()
     test_us006_no_longer_hardcodes_a_reused_scratch_path()
     test_suite_is_idempotent_across_back_to_back_runs()
+    test_empty_suite_is_not_green()
 
     print("\nALL HYG-05 RUNNER-HYGIENE CHECKS PASSED")
 

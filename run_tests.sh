@@ -29,7 +29,10 @@
 #   2. COUNTS SKIPS.  Tests emit `##SKIP## <name> :: <reason>` (tests/_skips.py);
 #      the runner greps them out of each test's captured output, prints them,
 #      and checks each name against tests/skips_allowed.txt. An unjustified skip
-#      FAILS the run. A skip is not a pass.
+#      FAILS the run. A skip is not a pass. It ALSO catches skips announced the
+#      OLD way -- a printed `[skip]`/`SKIPPED` line with no ##SKIP## marker --
+#      and fails those too, so the protocol cannot be bypassed by not using it.
+#      And it refuses to call an EMPTY suite (0 tests) green.
 #   3. GUARDS THE MANIFEST.  The default list below is checked BOTH ways against
 #      tests/test_*.py on disk: a test file that is not in the manifest fails the
 #      run (that is how tests/test_no_drift_us000.py went unrun for months), and
@@ -220,6 +223,42 @@ done < <(grep -hF -- "$SKIP_MARKER" "$LOGDIR"/*.log 2>/dev/null || true)
 skipped=${#skip_names[@]}
 
 # ---------------------------------------------------------------------------
+# Bare (UNROUTED) skips: the marker protocol only meters skips that go through
+# tests/_skips.py:skip(). A future author who writes the OLD idiom --
+# `print("[skip] no psana"); return` -- exits 0 with no ##SKIP## marker and
+# would score a silent PASS. That is the exact pre-fix bug (and this repo's own
+# history shows discipline alone has failed here). So we also scan each test's
+# captured log for a line that ANNOUNCES a skip the old way ("[skip]",
+# "SKIPPED", "skipping") but carries NO marker, and treat it as unjustified.
+#
+# Lines that DO carry the marker are excluded: those are the real ##SKIP##
+# lines, and our own prose that points a reader at them ("... SKIPPED -- see the
+# ##SKIP## line above"). A green psana-present run prints none of these, so the
+# scan is silent on a legitimately-green suite.
+# ---------------------------------------------------------------------------
+bare_skips=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && bare_skips+=("$line")
+done < <(grep -hiE '\[skip\]|skipping|skipped' "$LOGDIR"/*.log 2>/dev/null \
+           | grep -vF -- "$SKIP_MARKER" || true)
+n_bare=${#bare_skips[@]}
+
+# ---------------------------------------------------------------------------
+# Empty-suite guard: "0 passed, 0 failed, 0 skipped" must NOT be green. A suite
+# that ran nothing proves nothing.
+# ---------------------------------------------------------------------------
+if [[ $n -eq 0 ]]; then
+  echo
+  echo "======================================================================"
+  echo "pscalib acceptance suite -- summary"
+  echo "======================================================================"
+  echo "0 passed, 0 failed, 0 skipped  (of 0 test file(s))"
+  echo
+  echo "RESULT: FAIL -- ran 0 tests (empty suite proves nothing)."
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Summary + verdict.
 # ---------------------------------------------------------------------------
 echo
@@ -263,13 +302,25 @@ if [[ $skipped -gt 0 ]]; then
   done
 fi
 
+if [[ $n_bare -gt 0 ]]; then
+  echo
+  echo "UNROUTED SKIPS ($n_bare) -- a skip announced the OLD way, bypassing skip():"
+  for line in "${bare_skips[@]}"; do
+    echo "  ! $line"
+  done
+  echo "UNJUSTIFIED SKIP: <unrouted> -- a skip is not a pass (HYG-03/HYG-05)."
+  echo "  Route it through tests/_skips.py:skip(name, reason) so the runner can"
+  echo "  count it and check it against tests/skips_allowed.txt -- a printed"
+  echo "  '[skip]'/'SKIPPED' line with no ##SKIP## marker is an invisible skip."
+fi
+
 echo
-if [[ $failed -ne 0 || $unjustified -ne 0 ]]; then
-  if [[ $unjustified -ne 0 ]]; then
-    echo "RESULT: FAIL -- $failed failed, $unjustified unjustified skip(s)."
+if [[ $failed -ne 0 || $unjustified -ne 0 || $n_bare -ne 0 ]]; then
+  if [[ $unjustified -ne 0 || $n_bare -ne 0 ]]; then
+    echo "RESULT: FAIL -- $failed failed, $unjustified unjustified skip(s), $n_bare unrouted skip(s)."
     echo "A skipped oracle gate is NOT a passing oracle gate. Either fix the"
-    echo "environment (psconda.sh sourced? PYTHONPATH prepended, not replaced?)"
-    echo "or justify the skip in $ALLOW_FILE."
+    echo "environment (psconda.sh sourced? PYTHONPATH prepended, not replaced?),"
+    echo "route the skip through skip(name, reason), or justify it in $ALLOW_FILE."
   else
     echo "RESULT: FAIL -- $failed test file(s) failed."
   fi
