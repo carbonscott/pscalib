@@ -435,21 +435,131 @@ class Constants:
 
 
 # ==========================================================================
+# CAL-05: intersect the staleness check with the apply plugin's READ SET
+# ==========================================================================
+# The bug (CAL-05): the staleness guard checked the validity range of *every*
+# ctype the constants carry and refused if ANY was out of range -- including
+# ctypes the detector's apply plugin PROVABLY NEVER READS.  On the demo run
+# (ued1010667/r177, an epix10ka-family detector) the ``geometry`` doc is out of
+# validity range for the run, so the guard raised ``StaleConstantsError`` even
+# though ``geometry`` never touches the calibrated output: the epix10ka apply
+# reads only ``pedestals`` / ``pixel_gain`` / ``pixel_status`` / ``mask`` (see
+# ``pscalib.apply.epix10ka`` + ``registry.plugin_epix10ka``), and the assembled
+# image uses PRE-CACHED pixel-index maps, not the live geometry doc.  psana
+# returns a finite array; pscalib's false refusal made it strictly worse.
+#
+# The fix: enforce staleness ONLY over the ctypes the family's apply plugin
+# actually consumes -- ``present_ctypes ∩ read_set``.  A stale ctype the plugin
+# never reads (``geometry`` for epix10ka) no longer causes a refusal; a stale
+# ctype the plugin DOES read still fires the guard (it is NOT disabled, only
+# narrowed).
+#
+# The read-sets are DATA, seeded from exactly what each apply plugin pulls
+# (``registry._get_const(constants, <ctype>)`` in ``plugin_epix10ka`` /
+# ``plugin_jungfrau``, and the ``calib_*`` leaves they call):
+#   * epix10ka -- pedestals, pixel_gain, pixel_status, mask
+#                 (NOT pixel_offset, NOT geometry)
+#   * jungfrau -- pedestals, pixel_gain, pixel_offset, pixel_status, mask
+#                 (NOT geometry)
+# ``pixel_status`` is included because both plugins derive the default mask from
+# it (``mask_from_pixel_status``) when no cached ``mask`` is present.
+#: family token -> frozenset of the ctypes that family's apply plugin reads.
+_PLUGIN_READS = {
+    "epix10ka": frozenset({"pedestals", "pixel_gain", "pixel_status", "mask"}),
+    "jungfrau": frozenset({"pedestals", "pixel_gain", "pixel_offset",
+                           "pixel_status", "mask"}),
+}
+
+
+def _normalize_family(name):
+    """Normalize a detector type/class/detname to its family token, or ``None``.
+
+    A numpy-free mirror of :func:`pscalib.registry.detector_type_of` (kept local
+    so :mod:`pscalib.model` stays free of the registry -- and of the numpy the
+    registry pulls in): strip a psana ``<family>_raw_x_y_z`` suffix, lowercase,
+    and fold the epix10ka composite/family aliases onto ``"epix10ka"``.
+    """
+    if name is None:
+        return None
+    s = str(name)
+    for sep in ("_raw_", "_raw"):
+        if sep in s:
+            s = s.split(sep, 1)[0]
+            break
+    s = s.lower()
+    if s.startswith("epix10ka") or s in ("epixquad", "epix10kaquad",
+                                         "epix10ka2m"):
+        return "epix10ka"
+    return s
+
+
+def _family_from_pin(pin):
+    """Best-effort detector family carried by a :class:`Pin`, or ``None``.
+
+    The :class:`Pin` that already flows into :func:`check_validity` (a snapshot's
+    ``pin_obj`` or a web fetch's pin) names its detector -- ``detname``
+    (``"epixquad"`` / ``"jungfrau"``) or the ``detector_uniqueid`` family prefix
+    (``"epix10ka_..."``).  This is how the family reaches the guard WITHOUT
+    changing any caller: the read-set is recovered from the pin already passed.
+    """
+    if pin is None:
+        return None
+    detname = getattr(pin, "detname", None)
+    if detname:
+        return detname
+    uid = getattr(pin, "detector_uniqueid", None)
+    if isinstance(uid, str) and "_" in uid:
+        return uid.split("_", 1)[0]
+    return None
+
+
+def _read_set_for(family, pin):
+    """The ctype read-set to enforce staleness over, or ``None`` for "check all".
+
+    Resolves the family from an explicit ``family`` argument first, else from the
+    ``pin`` already passed to :func:`check_validity`.  Returns the family's
+    :data:`_PLUGIN_READS` set when it is a known family, or ``None`` when the
+    family cannot be determined or is not a registered leaf -- in which case the
+    guard falls back to checking EVERY ctype (the pre-CAL-05 behavior), so the
+    change is backward-compatible and never widens a refusal beyond what a known
+    plugin reads.
+    """
+    fam = _normalize_family(family if family is not None
+                            else _family_from_pin(pin))
+    if fam is not None and fam in _PLUGIN_READS:
+        return _PLUGIN_READS[fam]
+    return None
+
+
+# ==========================================================================
 # THE enforcement entry point (US-002)
 # ==========================================================================
-def check_validity(validities, run, allow_stale=False, pin=None, log=None):
+def check_validity(validities, run, allow_stale=False, pin=None, log=None,
+                   family=None):
     """Enforce that constants are valid for ``run`` -- refuse-by-default.
 
     This is the one correctness feature pscalib adds over psdata's advisory
     ``is_valid_for_run``.  Given a ``{ctype: Validity}`` map (from
     :func:`validities_from_calibconst`) and the run being calibrated:
 
-    * **in range** (every ctype's :meth:`Validity.contains` is True) -- returns
-      silently.
+    * **in range** (every *enforced* ctype's :meth:`Validity.contains` is True)
+      -- returns silently.
     * **out of range** and ``allow_stale=False`` (the default) -- raises
       :class:`StaleConstantsError` naming every offending ctype.
     * **out of range** and ``allow_stale=True`` -- logs a single ``warning`` and
       returns (the apply proceeds with stale constants).
+
+    CAL-05 -- staleness is enforced only over the ctypes the detector family's
+    apply plugin actually READS (``present_ctypes ∩ read_set``; see
+    :data:`_PLUGIN_READS`).  A stale ctype the plugin never consumes (e.g.
+    ``geometry`` for epix10ka -- the calibrated output and the pre-cached image
+    grid never touch it) does NOT trigger a refusal, matching psana, which
+    returns a finite array.  The read-set is recovered from ``family`` if given,
+    else from the ``pin`` already passed (its ``detname`` / ``detector_uniqueid``
+    names the detector) -- so the narrowing needs no change at the call site.
+    When the family cannot be determined (no ``family`` and no identifying
+    ``pin``) or is not a known plugin, EVERY ctype is checked (the pre-CAL-05
+    behavior), so the change is backward-compatible and never disables the guard.
 
     Parameters
     ----------
@@ -460,9 +570,16 @@ def check_validity(validities, run, allow_stale=False, pin=None, log=None):
     allow_stale : bool
         If True, downgrade an out-of-range refusal to a logged warning.
     pin : Pin | None
-        The pin the constants were taken for (for the error/warning message).
+        The pin the constants were taken for (for the error/warning message,
+        and -- CAL-05 -- as the fallback source of the detector family whose
+        read-set the check is intersected with).
     log : logging.Logger | None
         Logger to warn on (defaults to this module's logger).
+    family : str | None
+        Detector type / family / class name (CAL-05).  When given (or recovered
+        from ``pin``) and it maps to a known apply plugin, staleness is enforced
+        only over that plugin's read-set (:data:`_PLUGIN_READS`).  ``None`` and
+        an unknown family fall back to checking every ctype.
 
     Returns
     -------
@@ -476,7 +593,13 @@ def check_validity(validities, run, allow_stale=False, pin=None, log=None):
         If out of range and ``allow_stale`` is False.
     """
     run = int(run)
-    offenders = [(ct, v) for ct, v in sorted(validities.items())
+    # CAL-05: enforce only over the ctypes the family's apply plugin reads.  A
+    # read-set of None (unknown family) means "check all" (pre-CAL-05 behavior).
+    read_set = _read_set_for(family, pin)
+    items = validities.items()
+    if read_set is not None:
+        items = [(ct, v) for ct, v in items if ct in read_set]
+    offenders = [(ct, v) for ct, v in sorted(items)
                  if not v.contains(run)]
     if not offenders:
         return []
