@@ -78,6 +78,7 @@ MANIFEST=(
   "test_gate01_randaccess_coverage.py"
   "test_gate03_nan_equality.py"
   "test_gate05_retrieval_oracle.py"
+  "test_cor01b_gain_census.py"
   "test_runner_hygiene_hyg05.py"
 )
 
