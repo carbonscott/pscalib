@@ -33,6 +33,7 @@ __all__ = [
     "plugin_jungfrau", "plugin_epix10ka",
     "detector_type_of", "detector_type_for_constants",
     "UnvalidatedCalibVersionError", "validated_versions",
+    "ConstantsRawMismatchError",
 ]
 
 #: detector-type (str) -> plugin function.  Populated at import time with the
@@ -323,6 +324,120 @@ def _get_const(constants, ctype, required=True):
 
 
 # ==========================================================================
+# COR-03: bind the constants to the raw BEFORE applying them
+# ==========================================================================
+# The bug (COR-03): calib(det_type, raw, constants) dispatches to the family
+# plugin and applies ``constants`` to ``raw`` with NOTHING checking that the
+# constants actually belong to this raw.  Same-family constants of the WRONG
+# detector -- a different panel count, a different per-segment pixel geometry,
+# or a different jungfrau entirely -- are applied silently: jungfrau raw +
+# another jungfrau's pedestals/gain yields a finite ``(N,512,1024)`` image, no
+# error, a large max-abs-diff.  A scientist can calibrate detector A's data with
+# detector B's constants and publish a plausible-looking, wholly WRONG result.
+#
+# The apply leaves loop the raw's segments and index the constants per segment
+# (``gfac[stage, s]`` for ``s in range(raw.shape[0])``), so a constants stack
+# with MORE segments than the raw is silently tolerated (it indexes the leading
+# segments) and a per-pixel geometry mismatch either broadcasts wrong or blows
+# up deep in numpy with an opaque message.  The raw handed to :func:`calib` is a
+# BARE ndarray -- it carries no detector id -- so the strongest correspondence
+# bindable at this seam is the SHAPE the constants must project onto the raw:
+# every per-segment spatial constant must cover exactly the raw's segment set
+# and the raw's per-segment pixel geometry.  This is enforced here, BEFORE
+# dispatch, so a non-corresponding set raises a clear
+# :class:`ConstantsRawMismatchError` (naming raw shape vs constants shape)
+# instead of silently producing a wrong image.
+#
+# RESIDUAL GAP (documented deliberately): two DIFFERENT detectors of the SAME
+# family and SAME shape -- the literal COR-03 example, jungfrau A vs jungfrau B
+# both ``(32,512,1024)`` -- are NOT separable by shape alone.  Catching that
+# needs a detector IDENTITY on BOTH sides, but the raw is a bare ndarray with no
+# id to compare the constants' ``detname``/``detector_uniqueid`` (CAL-07
+# provenance) against.  Shape binding closes the wrong-panel-count /
+# wrong-geometry class; same-shape-different-detector is only catchable once the
+# raw itself carries (or the caller passes) its own identity.
+
+#: The per-segment spatial constants the apply leaves actually consume.  Each is
+#: shaped ``(..., n_segments, rows, cols)`` -- a gain-indexed 4-D constant
+#: (``(G, S, rows, cols)``) or the 3-D ``mask`` (``(S, rows, cols)``) -- so its
+#: segment count is ``shape[-3]`` and its per-segment geometry ``shape[-2:]``.
+_SPATIAL_CTYPES = ("pedestals", "pixel_gain", "pixel_offset", "pixel_status",
+                   "mask")
+
+
+class ConstantsRawMismatchError(ValueError):
+    """Raised when :func:`calib` is handed constants that do not correspond to
+    the ``raw`` they would be applied to (COR-03).
+
+    Nothing else binds the two: the apply plugin loops the raw's segments and
+    indexes the constants per segment, so constants for a *different* detector
+    of the same family (a different panel count or per-segment pixel geometry)
+    would be applied silently and yield a finite but wholly WRONG image.  This
+    refuses first, naming the offending ctype, the raw shape and the constants
+    shape.  Subclasses :class:`ValueError` (an argument-value problem) so a
+    caller catching ``ValueError`` gets the refusal, never a silent guess.
+    Carries ``ctype`` / ``raw_shape`` / ``const_shape`` / ``family`` /
+    ``raw_segments`` / ``const_segments`` for a caller to report or act on.
+    """
+
+    def __init__(self, ctype, raw_shape, const_shape, family,
+                 raw_segments, const_segments):
+        self.ctype = ctype
+        self.raw_shape = tuple(int(d) for d in raw_shape)
+        self.const_shape = tuple(int(d) for d in const_shape)
+        self.family = family
+        self.raw_segments = int(raw_segments)
+        self.const_segments = int(const_segments)
+        super().__init__(
+            f"pscalib refuses to calibrate: the {family!r} constants do NOT "
+            f"correspond to this raw. Constant {ctype!r} has shape "
+            f"{self.const_shape} ({self.const_segments} segment(s) of "
+            f"{self.const_shape[-2:]}), but raw has shape {self.raw_shape} "
+            f"({self.raw_segments} segment(s) of {self.raw_shape[-2:]}). "
+            f"Nothing binds constants to the raw they are applied to, so "
+            f"applying a DIFFERENT detector's constants (wrong panel count / "
+            f"pixel geometry) would silently produce a finite but WRONG "
+            f"calibrated image. Pass constants captured for THIS exact "
+            f"detector+run (a snapshot or web fetch pinned to it).")
+
+
+def _assert_constants_bind_raw(family, raw, constants):
+    """COR-03 gate: refuse to apply constants whose per-segment spatial shape
+    does not correspond to ``raw`` (segment count + per-segment pixel geometry).
+
+    No-op unless ``raw`` is a 3-D ``(n_segments, rows, cols)`` stack (the shape
+    every registered plugin consumes); a non-3-D raw is left for the plugin's
+    own ``raw must be 3-D`` error.  For each per-segment spatial constant that is
+    actually present (:data:`_SPATIAL_CTYPES`), require its segment count
+    (``shape[-3]``) and per-segment geometry (``shape[-2:]``) to equal the
+    raw's; a mismatch raises :class:`ConstantsRawMismatchError`.  Absent or
+    non-spatial (rank < 3) ctypes are skipped -- a missing REQUIRED ctype is the
+    plugin's own clear ``KeyError``, not a correspondence problem, and a
+    correctly-corresponding set (every existing byte-exact oracle) passes
+    untouched so the calibrated output is byte-unchanged.
+    """
+    arr = np.asarray(raw)
+    if arr.ndim != 3:
+        return                          # let the plugin raise its own ndim error
+    raw_segs, raw_rows, raw_cols = (int(d) for d in arr.shape)
+    for ctype in _SPATIAL_CTYPES:
+        c = _get_const(constants, ctype, required=False)
+        if c is None:
+            continue
+        c = np.asarray(c)
+        # a per-segment spatial constant is (..., n_segments, rows, cols); it
+        # needs at least those three trailing axes to name a segment + geometry.
+        if c.ndim < 3:
+            continue
+        const_segs = int(c.shape[-3])
+        const_rows, const_cols = int(c.shape[-2]), int(c.shape[-1])
+        if (const_rows, const_cols) != (raw_rows, raw_cols) \
+                or const_segs != raw_segs:
+            raise ConstantsRawMismatchError(
+                ctype, arr.shape, c.shape, family, raw_segs, const_segs)
+
+
+# ==========================================================================
 # Built-in plugins (the thin seam): plugin(raw, constants, config=None) -> calib
 # ==========================================================================
 def plugin_jungfrau(raw, constants, config=None):
@@ -469,6 +584,18 @@ def calib(*args, config=None, run=None, allow_stale=False, log=None,
     ``PSCALIB_ALLOW_UNVALIDATED_VERSION=1``) to override.  A bare family token /
     short detname (no version) or a validated version dispatches as before.
 
+    Constants<->raw binding (COR-03) is wired in: nothing else checks that the
+    ``constants`` actually correspond to the ``raw`` they are applied to, so a
+    different detector's same-family constants (wrong panel count / per-segment
+    pixel geometry) would be applied silently and yield a finite but WRONG
+    image.  Before dispatch, ``calib`` verifies every per-segment spatial
+    constant covers exactly the raw's segment set and per-segment geometry, and
+    raises :class:`ConstantsRawMismatchError` (naming raw shape vs constants
+    shape) on a mismatch.  A correctly-corresponding set is byte-unchanged.  The
+    residual gap: two DIFFERENT detectors of the SAME family and SAME shape are
+    not separable by shape alone (the raw is a bare ndarray with no identity to
+    bind the constants' provenance against).
+
     Parameters
     ----------
     *args
@@ -522,5 +649,9 @@ def calib(*args, config=None, run=None, allow_stale=False, log=None,
         version_hint = detector_type_hint(constants)
 
     _assert_version_validated(version_hint, norm, allow_unvalidated)
+    # COR-03: bind the constants to the raw (shape/segment correspondence)
+    # before dispatch, so a different detector's same-family constants raise a
+    # clear error instead of silently producing a wrong image.
+    _assert_constants_bind_raw(norm, raw, constants)
     _enforce_validity(constants, run, allow_stale, log)
     return get_plugin(norm)(raw, constants, config=config)
