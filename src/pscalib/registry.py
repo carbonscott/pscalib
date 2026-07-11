@@ -318,9 +318,46 @@ def _get_const(constants, ctype, required=True):
     if isinstance(val, (tuple, list)) and val and isinstance(val[0], np.ndarray):
         val = val[0]
     if val is None and required:
+        # CAL-04: an ESSENTIAL constant (e.g. pedestals) is absent.  psana
+        # cannot calibrate without it either, so pscalib still fails -- but with
+        # a clear, actionable message, not a bare ``KeyError(ctype)``.  This is
+        # the deliberate counterpart to the OPTIONAL-with-default path
+        # (:func:`_optional_const`): pixel_gain/pixel_offset get a psana default
+        # so a run whose DB merely lacks them still calibrates; a truly-essential
+        # constant is never silently fabricated -- "do not paper over it".
         raise KeyError(
-            f"constants are missing required ctype {ctype!r}")
+            f"required calibration constant {ctype!r} is absent from the "
+            f"constants mapping: pscalib cannot calibrate without it and "
+            f"neither can psana. (Unlike OPTIONAL constants, which psana "
+            f"degrades over -- a missing pixel_gain defaults to ones, "
+            f"pixel_offset to zeros.) Provide {ctype!r} for this exact "
+            f"detector+run (a snapshot or web fetch pinned to it).")
     return val
+
+
+def _optional_const(constants, ctype, like, fill):
+    """Fetch an OPTIONAL constant, substituting psana's default when absent (CAL-04).
+
+    The bug (CAL-04): when an optional calibration constant is missing from the
+    DB/snapshot, psana degrades gracefully -- a missing ``pixel_gain`` defaults
+    to all-ones (gain factor 1 everywhere -> no gain correction), a missing
+    ``pixel_offset`` to zeros -- so ``det.raw.calib(evt)`` still returns a finite
+    array.  pscalib pulled these with ``required=True`` and raised ``KeyError``
+    instead, so a run whose DB merely lacks a constant psana tolerates could not
+    be calibrated at all.
+
+    When ``ctype`` is present, return it unchanged (the all-present output is
+    byte-unchanged).  When it is ABSENT, return a correctly-shaped array filled
+    with ``fill`` (psana's default: ``1.0`` for ``pixel_gain``, ``0.0`` for
+    ``pixel_offset``) shaped like ``like`` -- a present constant, typically the
+    required ``pedestals`` whose segment set + per-segment geometry COR-03 has
+    already bound to the raw -- so the apply produces the SAME finite result
+    psana does for the missing constant instead of raising.
+    """
+    val = _get_const(constants, ctype, required=False)
+    if val is not None:
+        return val
+    return np.full_like(np.asarray(like, dtype=np.float32), fill)
 
 
 # ==========================================================================
@@ -455,7 +492,11 @@ def plugin_jungfrau(raw, constants, config=None):
     no mask is applied.
     """
     pedestals = _get_const(constants, "pedestals")
-    pixel_gain = _get_const(constants, "pixel_gain")
+    # CAL-04: pixel_gain is OPTIONAL -- psana defaults an absent gain to ones
+    # (gain factor 1 everywhere -> no gain correction), so substitute a ones
+    # array shaped like pedestals instead of raising KeyError.  pixel_offset is
+    # already optional (calib_jungfrau treats None as 0).
+    pixel_gain = _optional_const(constants, "pixel_gain", like=pedestals, fill=1.0)
     pixel_offset = _get_const(constants, "pixel_offset", required=False)
     mask = _get_const(constants, "mask", required=False)
     if mask is None:
@@ -496,7 +537,10 @@ def plugin_epix10ka(raw, constants, config=None):
             "asicPixelConfig) was not found in any front transition dgram, so "
             "the gain-range decode cannot run.")
     pedestals = _get_const(constants, "pedestals")
-    pixel_gain = _get_const(constants, "pixel_gain")
+    # CAL-04: pixel_gain is OPTIONAL -- psana defaults an absent gain to ones
+    # (gain factor 1 everywhere -> no gain correction), so substitute a ones
+    # array shaped like pedestals instead of raising KeyError.
+    pixel_gain = _optional_const(constants, "pixel_gain", like=pedestals, fill=1.0)
     mask = _get_const(constants, "mask", required=False)
     if mask is None:
         status = _get_const(constants, "pixel_status", required=False)
