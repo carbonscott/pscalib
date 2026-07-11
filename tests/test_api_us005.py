@@ -45,6 +45,12 @@ import tempfile
 
 import numpy as np
 
+# --- machine-readable skip protocol (HYG-05); see tests/_skips.py -----------
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from _skips import skip  # noqa: E402
+
 # --- locate the pscalib package (parent of this tests dir) ------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG_PARENT = os.path.join(os.path.dirname(_HERE), "src")  # .../pscalib/src
@@ -344,13 +350,17 @@ def main():
     test_whole_import_purity_subprocess()
 
     if not _have_psana():
-        print("\n[skip] psana not importable -- multi-detector byte-exact + "
-              "cross-provider gate skipped. Source psconda.sh on sdfiana025.")
-        print("\nUS-005 offline checks PASSED (psana-dependent gate skipped)")
+        skip("us005_psana_oracle_gates",
+             "psana not importable -- the multi-detector byte-exact + "
+             "cross-provider gates did NOT run. Source psconda.sh on sdfiana025.")
+        print("\nUS-005 offline checks PASSED (psana-dependent gate SKIPPED -- "
+              "see the ##SKIP## line above)")
         return
     if not _have_psdata():
-        print("\n[skip] psdata not importable -- pscalib depends on it. "
-              "Put psdata/src on PYTHONPATH (run_tests.sh does).")
+        skip("us005_psdata_missing",
+             "psdata not importable -- pscalib depends on it, so the "
+             "multi-detector gates did NOT run. Put psdata/src on PYTHONPATH "
+             "(run_tests.sh does).")
         return
 
     tmp = tempfile.mkdtemp(prefix="pscalib_us005_")

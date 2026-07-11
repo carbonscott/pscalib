@@ -33,6 +33,12 @@ import sys
 import numpy as np
 import pytest
 
+# --- machine-readable skip protocol (HYG-05); see tests/_skips.py -----------
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from _skips import skip  # noqa: E402
+
 # --- locate the pscalib package (parent of this tests dir) ------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG_PARENT = os.path.join(os.path.dirname(_HERE), "src")  # .../pscalib/src
@@ -183,9 +189,10 @@ def main():
     print("=" * 72)
 
     if not _have_psana():
-        print("\n[skip] psana not importable -- byte-exact + purity gates need "
-              "psana to read the ground truth uniqueid.  Source psconda.sh on "
-              "sdfiana025 and use run_tests.sh.")
+        skip("us001_psana_oracle_gates",
+             "psana not importable -- the byte-exact + purity gates need psana "
+             "to read the ground-truth uniqueid, so NOTHING in US-001 ran. "
+             "Source psconda.sh on sdfiana025 and use run_tests.sh.")
         return
 
     # (a) byte-exact retrieval vs psana _calibconst (webdb opens no DataSource).
