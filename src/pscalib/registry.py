@@ -199,18 +199,21 @@ def _version_identity(det_type):
 
     psana drp class names always carry the ``raw`` interface marker followed by
     a version triple (``epix10ka_raw_2_0_1``, ``jungfrau_raw_0_1_0``); the
-    presence of ``_raw`` is what distinguishes a specific *deployed class*
-    (which names an algorithm psana would pick) from a bare family token or
-    short detname (``epix10ka``, ``epixquad``, ``jungfrau``), which carries no
-    version to validate.  ``detector_type_of`` throws the version away for
+    ``_raw_<x>_<y>_<z>`` separator is what distinguishes a specific *deployed
+    class* (which names an algorithm psana would pick) from a bare family token
+    or short detname (``epix10ka``, ``epixquad``, ``jungfrau``), which carries
+    no version to validate.  ``detector_type_of`` throws the version away for
     LOOKUP; this keeps it for the validation gate.
     """
     if det_type is None:
         return None
     s = str(det_type)
     # a bare family / short detname (no interface marker) makes no version
-    # claim -- there is nothing to validate, so dispatch as before.
-    return s if "_raw" in s else None
+    # claim -- there is nothing to validate, so dispatch as before.  Anchor on
+    # the real psana ``_raw_`` separator (trailing underscore, exactly as
+    # detector_type_of splits) so a detname merely CONTAINING "_raw" is not
+    # misclassified as a versioned class name.
+    return s if "_raw_" in s else None
 
 
 def _env_allows_unvalidated():
@@ -232,6 +235,14 @@ def _assert_version_validated(det_type, family, allow_unvalidated=False):
     """
     version = _version_identity(det_type)
     if version is None:
+        return
+    # An UNREGISTERED family (no plugin at all) is an unsupported-DETECTOR
+    # problem, not a version-validation one.  Skip the gate and let get_plugin
+    # raise its clear "no apply plugin registered for ..." KeyError, rather than
+    # a misleading refusal that names plugin 'None' and tells the caller to add
+    # the version to _VALIDATED_VERSIONS.  Only families that actually have a
+    # single plugin can be "guessing" about which version that plugin fits.
+    if family not in _REGISTRY:
         return
     if version.lower() in _VALIDATED_VERSIONS.get(family, frozenset()):
         return
