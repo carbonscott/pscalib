@@ -74,6 +74,7 @@ MANIFEST=(
   "test_cor03_bind_constants.py"
   "test_cal04_absent_constants.py"
   "test_cal05_read_set_intersection.py"
+  "test_cal12_forward_expiry.py"
   "test_runner_hygiene_hyg05.py"
 )
 
