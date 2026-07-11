@@ -70,6 +70,7 @@ MANIFEST=(
   "test_cal07_provenance.py"
   "test_cal11_status_bits.py"
   "test_cal09_geometry_cache.py"
+  "test_cal15_version_dispatch.py"
   "test_runner_hygiene_hyg05.py"
 )
 
