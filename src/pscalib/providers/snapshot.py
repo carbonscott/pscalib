@@ -62,10 +62,16 @@ _MASK_FILE = "mask.npy"
 _GEOMETRY_FILE = "geometry.txt"
 
 #: Validity-metadata fields kept per ctype (psana attaches many more; these are
-#: the ones that define the validity range + provenance for pinning).
+#: the ones that define the validity range + provenance for pinning).  ``_id``
+#: (the source calib-DB document's immutable Mongo ObjectId) and ``time_stamp``
+#: (when it was deployed) are the *document identity*: the calib web DB is
+#: mutable, so the same (exp, run, det, ctype) query can later return a
+#: *different* document -- persisting ``_id``/``time_stamp`` is what lets a
+#: published number be traced back to the exact document that produced it, i.e.
+#: what makes a snapshot reproducible/auditable (CAL-07).
 _META_KEEP = (
     "run", "run_end", "version", "ctype", "detector", "detname", "dettype",
-    "longname", "time_sec", "time_stamp", "experiment",
+    "longname", "time_sec", "time_stamp", "experiment", "_id",
 )
 
 
@@ -146,6 +152,21 @@ class CalibSnapshot:
         the *first* run the constant is valid for; ``run_end`` the last (or the
         sentinel ``'end'``)."""
         return dict(self._manifest["validity"].get(ctype, {}))
+
+    def provenance(self, ctype):
+        """Source-document identity for ``ctype``: ``{'_id', 'time_stamp'}``.
+
+        ``_id`` is the immutable Mongo ObjectId (as a stable string) of the
+        exact calib-DB document this constant came from, and ``time_stamp`` when
+        it was deployed.  The calib web DB is mutable -- the same query can later
+        resolve to a *different* document -- so this pair is what lets a
+        published number be traced back to the document that produced it
+        (CAL-07).  Snapshots taken before provenance was persisted carry no
+        ``_id``; those report ``_id=None`` ("unknown provenance"), not an error,
+        so reloading old snapshots stays backward-compatible.
+        """
+        meta = self._manifest["validity"].get(ctype, {})
+        return {"_id": meta.get("_id"), "time_stamp": meta.get("time_stamp")}
 
     def validity_obj(self, ctype):
         """The :class:`pscalib.model.Validity` for ``ctype`` (the parsed
@@ -279,13 +300,28 @@ def _slim_meta(meta):
     """Keep the validity + provenance fields from a psana ctype metadata dict.
 
     psana attaches a large metadata doc per ctype; we retain the fields that
-    define the validity range (``run`` / ``run_end`` / ``version``) and identify
-    the constant, dropping DB-internal bookkeeping (``_id``, ``cwd``, ``host``,
-    ...) that is not load-bearing for offline reuse.
+    define the validity range (``run`` / ``run_end`` / ``version``), identify
+    the constant, and -- crucially for reproducibility -- pin the *source
+    document identity*: ``_id`` (its immutable Mongo ObjectId) and
+    ``time_stamp`` (when it was deployed).  The calib web DB is mutable, so
+    without ``_id``/``time_stamp`` a snapshotted number cannot be traced back to
+    the exact document that produced it (CAL-07).  Genuinely non-load-bearing
+    DB-internal bookkeeping (``cwd``, ``host``, ...) is still dropped.
+
+    The returned dict is directly JSON-serializable: an ObjectId is not, so
+    ``_id`` is coerced to its stable string form (the 24-char hex id) here --
+    the same string psana's own ``sec_and_ts_from_id`` treats as the doc's
+    identity -- rather than relying on a JSON ``default`` hook at write time.
     """
     if not isinstance(meta, dict):
         return {"_raw": str(meta)}
-    return {k: meta[k] for k in _META_KEEP if k in meta}
+    slim = {k: meta[k] for k in _META_KEEP if k in meta}
+    # An ObjectId (or any non-JSON-native id object) survives as a stable string
+    # so the filtered metadata round-trips through plain json.dumps unchanged.
+    if slim.get("_id") is not None and not isinstance(
+            slim["_id"], (str, int, float, bool)):
+        slim["_id"] = str(slim["_id"])
+    return slim
 
 
 def snapshot_calib(exp, run, dir, detname, out_dir,
