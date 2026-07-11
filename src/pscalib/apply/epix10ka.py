@@ -367,11 +367,13 @@ def calib_epix10ka(raw, pedestals, pixel_gain, seg_configs,
 # ==========================================================================
 # Default status mask (for the BYO / web path that has no cached mask)
 # ==========================================================================
-def status_as_mask(status, status_bits=(1 << 64) - 1):
+def status_as_mask(status, status_bits=0xffff):
     """Good/bad (1/0) mask from a ``pixel_status`` array.
 
     Faithful re-implementation of psana ``UtilsMask.status_as_mask``: a pixel is
-    good (1) iff none of the ``status_bits`` are set in its status word.
+    good (1) iff none of the ``status_bits`` are set in its status word.  The
+    default ``status_bits=0xffff`` (low 16 bits) matches psana's default, so a
+    pixel whose only status bit is >= 16 is kept -- exactly as psana keeps it.
     """
     status = np.asarray(status)
     cond = (status & status_bits) > 0
@@ -400,13 +402,14 @@ def merge_mask_for_grinds(mask, gain_range_inds=(0, 1, 2, 3, 4)):
     return out
 
 
-def mask_from_pixel_status(pixel_status, status_bits=(1 << 64) - 1,
+def mask_from_pixel_status(pixel_status, status_bits=0xffff,
                            gain_range_inds=(0, 1, 2, 3, 4)):
     """Build the default epix10ka calib mask from ``pixel_status``.
 
     Reproduces psana's default ``det.raw._mask()`` for epix10ka (which
-    ``det.raw.calib(evt)`` uses): :func:`status_as_mask` over the full status
-    bitword, then :func:`merge_mask_for_grinds` over gain ranges ``(0,1,2,3,4)``.
+    ``det.raw.calib(evt)`` uses): :func:`status_as_mask` over the low 16 status
+    bits (psana ``UtilsMask.status_as_mask``'s default ``status_bits=0xffff``),
+    then :func:`merge_mask_for_grinds` over gain ranges ``(0,1,2,3,4)``.
     Use this on the BYO / web retrieval path (where no cached mask was
     snapshotted) to get a byte-exact result.
 
@@ -415,7 +418,9 @@ def mask_from_pixel_status(pixel_status, status_bits=(1 << 64) - 1,
     pixel_status : ndarray, shape ``(7, n_segments, 352, 384)``, uint64
         The ``pixel_status`` calibration constant.
     status_bits : int
-        Status bits to treat as "bad" (default: all 64).
+        Status bits to treat as "bad" (default: ``0xffff``, the low 16 bits --
+        matching psana's ``UtilsMask.status_as_mask`` default; a pixel is masked
+        iff any selected bit is set in its status word).
     gain_range_inds : sequence of int
         Gain ranges to merge (default epix10ka's ``(0,1,2,3,4)``).
 
