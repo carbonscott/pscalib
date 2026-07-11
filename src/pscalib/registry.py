@@ -21,6 +21,8 @@ leaves so both share one dispatch.  Pure numpy -- importing it pulls in only
 numpy (the apply leaves it imports are numpy-only).
 """
 
+import os
+
 import numpy as np
 
 from .apply.jungfrau import calib_jungfrau, N_GAIN_STAGES as _JF_STAGES
@@ -30,11 +32,113 @@ __all__ = [
     "register", "get_plugin", "registered_types", "calib",
     "plugin_jungfrau", "plugin_epix10ka",
     "detector_type_of", "detector_type_for_constants",
+    "UnvalidatedCalibVersionError", "validated_versions",
 ]
 
 #: detector-type (str) -> plugin function.  Populated at import time with the
 #: built-in leaves (see the ``register`` calls at the bottom).
 _REGISTRY = {}
+
+
+# ==========================================================================
+# CAL-15: version-aware dispatch guard ("know what you don't know")
+# ==========================================================================
+# The bug (CAL-15): pscalib dispatches on the detector FAMILY token
+# (``epix10ka_raw_3_0_1`` -> ``epix10ka``), but *psana* selects the calib
+# ALGORITHM from the full VERSION TRIPLE -- the deployed release ships two
+# epix10ka calib implementations (``calib_epix10ka_v02`` for the newer class,
+# the legacy ``calib_epix10ka_any`` for classes that don't override).  Raw
+# decode is self-describing; calibration is NOT -- the algorithm is chosen by a
+# token the old ``detector_type_of`` throws away.  pscalib has ONE plugin per
+# family, so applying it to a version it was never byte-exactness-tested against
+# is a *silent guess*.
+#
+# This module cannot grow a second epix10ka implementation (that is a feature,
+# out of scope).  What it MUST do is stop guessing silently: keep the family
+# normalization for LOOKUP, but ALSO record which full version triples the
+# single family plugin has actually been validated against, and REFUSE (by
+# default) when handed an unknown/unvalidated version rather than applying the
+# plugin with no signal at all.  Same class of fix as psdata's DET-10.
+#
+# Seeding -- the version triples below are the ONLY ones this repo's
+# byte-exactness oracle has actually measured pscalib's single plugin against:
+#
+#   * ``epix10ka_raw_2_0_1`` -- the class of ``det.raw`` in the epix10ka
+#     byte-exact gate (exp=ued1010667 run=177 det=epixquad; see
+#     ``tests/test_epix10ka_us004.py`` -- ``det_type = type(det.raw).__name__``
+#     -- and the explicit synthetic calls in test_epix10ka_us004 /
+#     test_epix10ka_trbit_us008).  ``max|diff| == 0`` vs ``det.raw.calib(evt)``.
+#   * ``jungfrau_raw_0_1_0`` -- the jungfrau raw class of the byte-exact render
+#     gate (exp=mfx100848724 run=51 det=jungfrau; see
+#     ``tests/test_calib_us000.py`` and the explicit call in
+#     ``tests/test_purity_us007.py``).  ``max|diff| == 0`` vs
+#     ``det.raw.calib(evt)``.
+#
+# UNCERTAINTY (documented deliberately): the repo records the *class names*
+# above but does NOT record which psana calib FUNCTION produced each ground
+# truth -- that is the very information CAL-15 says was never captured.  So this
+# set is deliberately CONSERVATIVE: it lists only versions with a recorded
+# byte-exact gate.  A genuinely-new deployed class (e.g. ``epix10ka_raw_3_0_1``,
+# which psana routes to ``calib_epix10ka_v02``) is intentionally ABSENT -- it
+# must be proven byte-exact and added here explicitly, never guessed at.
+#: family token -> frozenset of validated psana drp class names (lowercase).
+_VALIDATED_VERSIONS = {
+    "epix10ka": frozenset({"epix10ka_raw_2_0_1"}),
+    "jungfrau": frozenset({"jungfrau_raw_0_1_0"}),
+}
+
+#: env escape hatch: set to 1/true/yes/on to allow an unvalidated version
+#: through (mirrors the ``allow_unvalidated=True`` opt-in kwarg on :func:`calib`).
+_ENV_ALLOW_UNVALIDATED = "PSCALIB_ALLOW_UNVALIDATED_VERSION"
+
+
+class UnvalidatedCalibVersionError(ValueError):
+    """Raised when :func:`calib` is asked to apply constants for a detector
+    whose full VERSION TRIPLE is not in the family's validated set (CAL-15).
+
+    Refuse-by-default (mirrors :class:`pscalib.model.StaleConstantsError`):
+    pscalib has a *single* apply plugin per family, and the version triple --
+    which family-token dispatch discards -- is exactly what psana uses to pick
+    the calib algorithm.  Rather than silently apply the one plugin to a version
+    it was never byte-exactness-tested against, pscalib refuses and names the
+    class, family, and the plugin it WOULD have used.  Carries ``det_class`` /
+    ``family`` / ``plugin_name`` / ``validated`` for a caller to report or act
+    on.  Subclasses :class:`ValueError` (it is an argument-value problem) so a
+    caller catching ``ValueError`` gets the refusal, never a silent guess.
+    """
+
+    def __init__(self, det_class, family, plugin_name, validated):
+        self.det_class = det_class
+        self.family = family
+        self.plugin_name = plugin_name
+        self.validated = sorted(validated)
+        super().__init__(
+            f"pscalib refuses to calibrate {det_class!r}: this is an "
+            f"UNVALIDATED version of the {family!r} detector family. pscalib "
+            f"has a SINGLE {family!r} apply plugin ({plugin_name}), and this "
+            f"repo's byte-exactness oracle has only validated it against "
+            f"{self.validated!r}. psana chooses the calib ALGORITHM from the "
+            f"full version triple (the deployed release ships more than one "
+            f"epix10ka calib implementation), and family dispatch would discard "
+            f"exactly that token -- so applying {plugin_name} to {det_class!r} "
+            f"here would be a SILENT GUESS with no signal that it was never "
+            f"validated. If you have independently confirmed {plugin_name} is "
+            f"byte-exact for {det_class!r}, add it to "
+            f"pscalib.registry._VALIDATED_VERSIONS[{family!r}], or pass "
+            f"allow_unvalidated=True to calib(...) (or set env "
+            f"{_ENV_ALLOW_UNVALIDATED}=1) to proceed at your own risk.")
+
+
+def validated_versions(family=None):
+    """The validated version triples (CAL-15).
+
+    With ``family`` (a family token or a psana class name -- it is normalized),
+    return the sorted list of validated psana class names for that family.
+    Without it, return a ``{family: [class, ...]}`` snapshot of the whole map.
+    """
+    if family is None:
+        return {f: sorted(v) for f, v in _VALIDATED_VERSIONS.items()}
+    return sorted(_VALIDATED_VERSIONS.get(detector_type_of(family), ()))
 
 
 def register(det_type, plugin):
@@ -87,6 +191,67 @@ def detector_type_of(det_type):
                                          "epix10ka2m"):
         return "epix10ka"
     return s
+
+
+def _version_identity(det_type):
+    """Return the full versioned psana class name if ``det_type`` carries a
+    version triple, else ``None`` (CAL-15).
+
+    psana drp class names always carry the ``raw`` interface marker followed by
+    a version triple (``epix10ka_raw_2_0_1``, ``jungfrau_raw_0_1_0``); the
+    ``_raw_<x>_<y>_<z>`` separator is what distinguishes a specific *deployed
+    class* (which names an algorithm psana would pick) from a bare family token
+    or short detname (``epix10ka``, ``epixquad``, ``jungfrau``), which carries
+    no version to validate.  ``detector_type_of`` throws the version away for
+    LOOKUP; this keeps it for the validation gate.
+    """
+    if det_type is None:
+        return None
+    s = str(det_type)
+    # a bare family / short detname (no interface marker) makes no version
+    # claim -- there is nothing to validate, so dispatch as before.  Anchor on
+    # the real psana ``_raw_`` separator (trailing underscore, exactly as
+    # detector_type_of splits) so a detname merely CONTAINING "_raw" is not
+    # misclassified as a versioned class name.
+    return s if "_raw_" in s else None
+
+
+def _env_allows_unvalidated():
+    """True iff the CAL-15 env escape hatch is set to a truthy value."""
+    return os.environ.get(_ENV_ALLOW_UNVALIDATED, "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _assert_version_validated(det_type, family, allow_unvalidated=False):
+    """CAL-15 gate: refuse to dispatch a version this family's single plugin was
+    never validated against, unless the caller explicitly opts in.
+
+    No-op when ``det_type`` carries no version (a bare family / short detname --
+    :func:`_version_identity` returns ``None``) or the version is in the
+    family's validated set.  Otherwise raises
+    :class:`UnvalidatedCalibVersionError` (refuse-by-default) unless
+    ``allow_unvalidated`` or the ``PSCALIB_ALLOW_UNVALIDATED_VERSION`` env flag
+    is set.
+    """
+    version = _version_identity(det_type)
+    if version is None:
+        return
+    # An UNREGISTERED family (no plugin at all) is an unsupported-DETECTOR
+    # problem, not a version-validation one.  Skip the gate and let get_plugin
+    # raise its clear "no apply plugin registered for ..." KeyError, rather than
+    # a misleading refusal that names plugin 'None' and tells the caller to add
+    # the version to _VALIDATED_VERSIONS.  Only families that actually have a
+    # single plugin can be "guessing" about which version that plugin fits.
+    if family not in _REGISTRY:
+        return
+    if version.lower() in _VALIDATED_VERSIONS.get(family, frozenset()):
+        return
+    if allow_unvalidated or _env_allows_unvalidated():
+        return
+    plugin = _REGISTRY.get(family)
+    plugin_name = getattr(plugin, "__name__", repr(plugin))
+    raise UnvalidatedCalibVersionError(
+        version, family, plugin_name, _VALIDATED_VERSIONS.get(family, ()))
 
 
 def detector_type_for_constants(constants):
@@ -264,7 +429,8 @@ def _enforce_validity(constants, run, allow_stale, log):
     check_validity(validities, run, allow_stale=allow_stale, pin=pin, log=log)
 
 
-def calib(*args, config=None, run=None, allow_stale=False, log=None):
+def calib(*args, config=None, run=None, allow_stale=False, log=None,
+          allow_unvalidated=False):
     """Apply calibration constants to ``raw`` in pure numpy -- the public surface.
 
     Two call forms share this one entry point (and one registry dispatch):
@@ -293,6 +459,16 @@ def calib(*args, config=None, run=None, allow_stale=False, log=None):
     downgrades to a warning, in range is silent.  With no ``run`` the check is
     skipped (preserving the US-000/US-004 byte-exact numbers).
 
+    Version-dispatch guard (CAL-15) is wired in: dispatch normalizes to the
+    detector *family* (one plugin per family), but psana chooses the calib
+    *algorithm* from the full version triple.  When the detector class carries a
+    version triple that this family's single plugin was never byte-exactness
+    validated against, ``calib`` REFUSES (raises
+    :class:`UnvalidatedCalibVersionError`) rather than silently guessing -- pass
+    ``allow_unvalidated=True`` (or set env
+    ``PSCALIB_ALLOW_UNVALIDATED_VERSION=1``) to override.  A bare family token /
+    short detname (no version) or a validated version dispatches as before.
+
     Parameters
     ----------
     *args
@@ -307,6 +483,10 @@ def calib(*args, config=None, run=None, allow_stale=False, log=None):
         Downgrade an out-of-range refusal to a logged warning.
     log : logging.Logger, optional
         Logger for the staleness warning.
+    allow_unvalidated : bool
+        Opt in to applying the family plugin to a version triple that is not in
+        the family's validated set (CAL-15).  Refuse-by-default (``False``);
+        set ``True`` only when you have independently confirmed byte-exactness.
 
     Returns
     -------
@@ -321,6 +501,9 @@ def calib(*args, config=None, run=None, allow_stale=False, log=None):
                 f"det_type, raw and constants; got {len(args)} positional args")
         det_type, raw, constants = args
         norm = detector_type_of(det_type)
+        # CAL-15: the caller named a specific class -- keep its full version and
+        # gate on it (refuse-by-default for an unvalidated version triple).
+        version_hint = det_type
     else:
         # inferred form: calib(raw, constants)
         if len(args) != 2:
@@ -330,6 +513,14 @@ def calib(*args, config=None, run=None, allow_stale=False, log=None):
                 "detector type use calib(det_type, raw, constants, ...))")
         raw, constants = args
         norm = detector_type_for_constants(constants)
+        # CAL-15: recover the FULL identity the constants carry (a snapshot's
+        # detname, a web fetch's dettype, ...) so a version triple is validated
+        # here too, not silently normalized away.  (Real snapshots carry only a
+        # bare family/short detname, so this is a no-op for them -- but if a
+        # provider ever names a specific class it is gated, not guessed.)
+        from .model import detector_type_hint
+        version_hint = detector_type_hint(constants)
 
+    _assert_version_validated(version_hint, norm, allow_unvalidated)
     _enforce_validity(constants, run, allow_stale, log)
     return get_plugin(norm)(raw, constants, config=config)
