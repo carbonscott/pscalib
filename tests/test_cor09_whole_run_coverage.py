@@ -210,6 +210,135 @@ def test_positions_flag_and_hazard_mechanism_exist():
         "still present -- COR-09 not fixed.")
 
 
+class _FakeIndex:
+    """Minimal stand-in for psdata's random-access index: exposes only
+    ``entries`` (``entries[k] = {stream: (chunk_path, offset, size)}``), which
+    is all :func:`chunk_boundary_positions` reads."""
+    def __init__(self, entries):
+        self.entries = entries
+
+
+def test_resolve_positions_hazards_reaches_tail_and_hits_both_hazards():
+    """FUNCTIONAL: resolve_positions(positions="hazards") on a synthetic run with
+    a LATE chunk-roll (k=37,120, STR-01) and a BeginStep (k=8,000, CAL-02) must
+    REACH THE TAIL and probe +/-1 around BOTH hazards -- the headline COR-09
+    claim, exercised for real (not name-checked).
+
+    PARENT: no resolve_positions helper -> FAILS.  FIX: PASSES.
+    """
+    mod = _load_module()
+    assert hasattr(mod, "resolve_positions"), "no resolve_positions helper"
+    n_events = 40000
+    step_k, chunk_k = 8000, 37120
+    pos = set(mod.resolve_positions(
+        n_events, nevents=100, positions="hazards",
+        step_boundaries=[step_k], chunk_boundaries=[chunk_k]))
+    # reaches the LAST event of the whole run
+    assert max(pos) == n_events - 1, (
+        f"hazards request did not reach the tail: max={max(pos)} != "
+        f"{n_events - 1}")
+    # +/-1 around the LATE chunk-roll (STR-01) and the BeginStep (CAL-02)
+    assert {chunk_k - 1, chunk_k, chunk_k + 1}.issubset(pos), (
+        f"chunk-roll hazard +/-1 around k={chunk_k} missing "
+        f"({sorted({chunk_k - 1, chunk_k, chunk_k + 1} - pos)})")
+    assert {step_k - 1, step_k, step_k + 1}.issubset(pos), (
+        f"BeginStep hazard +/-1 around k={step_k} missing "
+        f"({sorted({step_k - 1, step_k, step_k + 1} - pos)})")
+
+
+def test_resolve_positions_explicit_list_with_negative_index():
+    """FUNCTIONAL: resolve_positions(positions="3,100,-1") must yield exactly
+    {3, 100, n_events-1} -- the negative index counts from the END.
+
+    PARENT: no resolve_positions helper -> FAILS.  FIX: PASSES.
+    """
+    mod = _load_module()
+    assert hasattr(mod, "resolve_positions"), "no resolve_positions helper"
+    n_events = 40000
+    pos = mod.resolve_positions(n_events, positions="3,100,-1")
+    assert set(pos) == {3, 100, n_events - 1}, (
+        f"explicit list resolved to {pos}, expected "
+        f"{{3, 100, {n_events - 1}}} (negative index from the end)")
+    assert list(pos) == sorted(pos), "explicit positions must be sorted"
+
+
+def test_step_boundary_positions_first_l1_at_or_after_step_ts():
+    """FUNCTIONAL: step_boundary_positions maps each BeginStep ts to the FIRST
+    L1Accept at/after it (the searchsorted side="left" contract).
+
+    PARENT: no step_boundary_positions helper -> FAILS.  FIX: PASSES.
+    """
+    mod = _load_module()
+    assert hasattr(mod, "step_boundary_positions"), \
+        "no step_boundary_positions helper"
+    l1_ts = np.array([10, 20, 30, 40, 50], dtype=np.uint64)
+    # ts=25 -> first L1 at/after is index 2 (value 30); ts=40 (exact) -> index 3;
+    # ts=10 (== BeginRun-ish first) -> index 0; ts=999 (past end) -> dropped.
+    got = mod.step_boundary_positions(l1_ts, np.array([25, 40, 10, 999],
+                                                      dtype=np.uint64))
+    assert got == [0, 2, 3], (
+        f"step->L1 mapping wrong: got {got}, expected [0, 2, 3] "
+        f"(first L1Accept at/after each step ts; past-end dropped)")
+    # a BeginStep ts equal to an L1 ts maps to THAT event (side='left').
+    assert mod.step_boundary_positions(l1_ts, np.array([30], dtype=np.uint64)) \
+        == [2]
+    # empty / None inputs are handled without raising.
+    assert mod.step_boundary_positions(l1_ts, None) == []
+    assert mod.step_boundary_positions(np.array([], dtype=np.uint64),
+                                       np.array([5], dtype=np.uint64)) == []
+
+
+def test_chunk_boundary_positions_returns_roll_and_predecessor():
+    """FUNCTIONAL: chunk_boundary_positions returns [k-1, k] at a c000->c001 roll
+    read from a fake index's per-stream entries.
+
+    PARENT: no chunk_boundary_positions helper -> FAILS.  FIX: PASSES.
+    """
+    mod = _load_module()
+    assert hasattr(mod, "chunk_boundary_positions"), \
+        "no chunk_boundary_positions helper"
+    # stream 0 rolls c000->c001 at k=3; stream 1 stays put (no false positive).
+    entries = [
+        {0: ("c000", 0, 8), 1: ("s1c000", 0, 8)},   # k=0
+        {0: ("c000", 8, 8), 1: ("s1c000", 8, 8)},   # k=1
+        {0: ("c000", 16, 8), 1: ("s1c000", 16, 8)}, # k=2
+        {0: ("c001", 0, 8), 1: ("s1c000", 24, 8)},  # k=3  <- roll on stream 0
+        {0: ("c001", 8, 8), 1: ("s1c000", 32, 8)},  # k=4
+    ]
+    got = mod.chunk_boundary_positions(_FakeIndex(entries))
+    assert got == [2, 3], (
+        f"chunk-roll discovery wrong: got {got}, expected [2, 3] (roll at k=3 "
+        f"plus its predecessor k=2)")
+    # a second roll (c001->c002 at k=... ) is also reported, both anchors.
+    entries2 = entries + [{0: ("c002", 0, 8), 1: ("s1c000", 40, 8)}]  # k=5 roll
+    assert mod.chunk_boundary_positions(_FakeIndex(entries2)) == [2, 3, 4, 5]
+    # an index without .entries yields [] (best-effort, no raise).
+    assert mod.chunk_boundary_positions(object()) == []
+
+
+def test_parse_explicit_positions_negatives_and_out_of_range():
+    """FUNCTIONAL: _parse_explicit_positions resolves negatives from the tail and
+    DROPS out-of-range indices (this fix's documented spec), sorted + distinct.
+
+    PARENT: no _parse_explicit_positions helper -> FAILS.  FIX: PASSES.
+    """
+    mod = _load_module()
+    assert hasattr(mod, "_parse_explicit_positions"), \
+        "no _parse_explicit_positions helper"
+    n_events = 40000
+    got = mod._parse_explicit_positions("-1,0,5", n_events)
+    assert got == [0, 5, n_events - 1], (
+        f"got {got}, expected [0, 5, {n_events - 1}] (negative from the end)")
+    # out-of-range (too big / too negative) is DROPPED; duplicates collapse.
+    got2 = mod._parse_explicit_positions("5, 5, 999999, -999999, 40000", n_events)
+    assert got2 == [5], (
+        f"out-of-range not dropped / dup not collapsed: got {got2}, "
+        f"expected [5] (40000 == n_events is out of [0, n_events-1])")
+    # an iterable (not a string) is accepted too.
+    assert mod._parse_explicit_positions([3, -1, 3], n_events) == \
+        [3, n_events - 1]
+
+
 def test_nan_aware_eq_calib_and_psana_oracle_preserved():
     """GATE-03's NaN-aware eq_calib and the psana-oracle structure must be
     preserved by the COR-09 fix (do NOT revert them)."""
@@ -239,6 +368,11 @@ def main():
     test_positions_reach_last_across_run_sizes()
     test_stride_reaches_tail_not_just_a_prefix()
     test_positions_flag_and_hazard_mechanism_exist()
+    test_resolve_positions_hazards_reaches_tail_and_hits_both_hazards()
+    test_resolve_positions_explicit_list_with_negative_index()
+    test_step_boundary_positions_first_l1_at_or_after_step_ts()
+    test_chunk_boundary_positions_returns_roll_and_predecessor()
+    test_parse_explicit_positions_negatives_and_out_of_range()
     test_nan_aware_eq_calib_and_psana_oracle_preserved()
     print("COR-09 whole-run coverage regression: all checks PASS")
 
