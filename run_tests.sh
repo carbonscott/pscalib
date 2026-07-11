@@ -67,6 +67,7 @@ MANIFEST=(
   "test_geometry_us006.py"
   "test_purity_us007.py"
   "test_epix10ka_trbit_us008.py"
+  "test_cal07_provenance.py"
   "test_runner_hygiene_hyg05.py"
 )
 
