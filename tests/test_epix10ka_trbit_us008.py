@@ -71,6 +71,12 @@ import tempfile
 
 import numpy as np
 
+# --- machine-readable skip protocol (HYG-05); see tests/_skips.py -----------
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from _skips import skip  # noqa: E402
+
 # --- locate the pscalib package (parent of this tests dir) ------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG_PARENT = os.path.join(os.path.dirname(_HERE), "src")  # .../pscalib/src
@@ -413,9 +419,11 @@ def main():
     test_offline_apply_purity_subprocess()
 
     if not _have_psana():
-        print("\n[skip] psana not importable -- byte-exact oracle gate skipped. "
-              "Source psconda.sh on sdfiana025.")
-        print("\nUS-008 offline checks PASSED (psana oracle gate skipped)")
+        skip("us008_psana_oracle_gate",
+             "psana not importable -- the synthetic mixed-trbit byte-exact "
+             "oracle gate did NOT run. Source psconda.sh on sdfiana025.")
+        print("\nUS-008 offline checks PASSED (psana oracle gate SKIPPED -- see "
+              "the ##SKIP## line above)")
         return
 
     tmp = tempfile.mkdtemp(prefix="pscalib_us008_")

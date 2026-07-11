@@ -1,0 +1,27 @@
+# Justified skips for the pscalib acceptance suite (HYG-03 / HYG-05).
+#
+# A skip is not a pass.  `run_tests.sh` counts every `##SKIP## <name> :: <reason>`
+# marker the suite emits (see tests/_skips.py) and FAILS the run for any name
+# that does not appear below.  This file is the ONLY place a skip can be
+# forgiven, and every entry must carry a justification that survives review.
+#
+# Format, one record per line:
+#     <name> :: <justification>
+# Lines starting with '#' and blank lines are ignored.
+#
+# The bar for an entry here is: the check CANNOT meaningfully run, AND its
+# coverage is not lost (something else authoritative still enforces it).
+#
+# Deliberately NOT listed -- these must fail the suite, loudly:
+#   * every `..._psana_...` skip.  psana is the ORACLE this conformance suite
+#     exists to be compared against.  A run without psana proves nothing.  It is
+#     also the exact shape of the known `psconda PYTHONPATH clobber` trap: put
+#     <repo>/src ahead of the psana env and every byte-exact gate skips itself
+#     into a green run.  If these skip, the suite was invoked wrong -- say so.
+#   * every `..._psdata_missing` skip.  psdata is a hard dependency of pscalib,
+#     not an optional extra; run_tests.sh puts it on PYTHONPATH itself.  Its
+#     absence is a broken environment, not a licence to pass.
+#   * `us006_derive_render_purity_no_snapshot_dir`, which is only reachable
+#     because the psana-dependent render step above it skipped.
+
+us000_no_drift_inproc_purity_dirty_interpreter :: In-process import-purity probe; only meaningful in a CLEAN interpreter. Under a whole-suite pytest run a sibling cross-check test may already have imported psana into this same process, in which case asserting here would be a false failure, not a real one. Coverage is NOT lost: the authoritative fresh-subprocess purity gate (test_purity_us007.py, plus the subprocess probes in test_calib_us000.py / test_geometry_us006.py) still runs and still enforces it. Under run_tests.sh this skip cannot fire at all -- each test file is its own process and this one never imports psana.
