@@ -367,11 +367,13 @@ def calib_epix10ka(raw, pedestals, pixel_gain, seg_configs,
 # ==========================================================================
 # Default status mask (for the BYO / web path that has no cached mask)
 # ==========================================================================
-def status_as_mask(status, status_bits=(1 << 64) - 1):
+def status_as_mask(status, status_bits=0xffff):
     """Good/bad (1/0) mask from a ``pixel_status`` array.
 
     Faithful re-implementation of psana ``UtilsMask.status_as_mask``: a pixel is
-    good (1) iff none of the ``status_bits`` are set in its status word.
+    good (1) iff none of the ``status_bits`` are set in its status word.  The
+    default ``status_bits=0xffff`` (low 16 bits) matches psana's default, so a
+    pixel whose only status bit is >= 16 is kept -- exactly as psana keeps it.
     """
     status = np.asarray(status)
     cond = (status & status_bits) > 0

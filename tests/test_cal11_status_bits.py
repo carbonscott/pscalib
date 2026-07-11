@@ -35,7 +35,10 @@ _PKG_PARENT = os.path.join(os.path.dirname(_HERE), "src")  # .../pscalib/src
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
 
-from pscalib.apply.epix10ka import mask_from_pixel_status  # noqa: E402
+from pscalib.apply.epix10ka import (  # noqa: E402
+    mask_from_pixel_status,
+    status_as_mask,
+)
 
 # A status word with ONLY bit 20 set: >= bit 16, and all-zero in the low 16
 # bits.  psana (0xffff) ignores it -> pixel kept; the old pscalib default
@@ -94,6 +97,31 @@ def test_default_ignores_high_status_bits():
     assert int(mask[_C]) == 1, "clean (status 0) pixel must be kept under default"
 
 
+def test_status_as_mask_default_matches_psana():
+    """The HELPER ``status_as_mask`` (the shared psana routine both entry points
+    re-implement) must ALSO default to ``0xffff``: a direct
+    ``status_as_mask(status)`` keeps a pixel whose only status bit is >= 16.
+
+    This discriminates on the helper too -- a future direct caller of
+    ``status_as_mask(status)`` would otherwise reintroduce the CAL-11 divergence.
+    Parent default is the wide 64-bit mask -> high-bit pixel masked -> FAILS;
+    fix default is 0xffff -> high-bit pixel kept -> PASSES.
+    """
+    status = _make_status()
+    smask = status_as_mask(status)                 # DEFAULT status_bits, no merge
+    assert smask.shape == status.shape, smask.shape
+
+    # High-bit-only pixel (plane 0) must be KEPT under the default.
+    assert int(smask[(0,) + _A]) == 1, (
+        "CAL-11 (helper): default status_as_mask masked a pixel whose only "
+        "status bit is bit %d (>= 16); psana (status_bits=0xffff) keeps it. "
+        "status_as_mask default must be 0xffff. got smask[0,A]=%d"
+        % (_HIGH_BIT, int(smask[(0,) + _A])))
+    # Normal masking intact: bit-0 pixel masked, clean pixel kept.
+    assert int(smask[(0,) + _B]) == 0, "bit-0 pixel must be masked (helper default)"
+    assert int(smask[(0,) + _C]) == 1, "clean pixel must be kept (helper default)"
+
+
 def test_explicit_status_bits_still_selectable():
     """A caller may still pass an explicit ``status_bits``; narrow (0xffff) and
     wide ((1<<64)-1) DIFFER precisely on the high-bit pixel -- proving the fix
@@ -124,6 +152,7 @@ def test_explicit_status_bits_still_selectable():
 def main():
     tests = (
         test_default_ignores_high_status_bits,
+        test_status_as_mask_default_matches_psana,
         test_explicit_status_bits_still_selectable,
     )
     for t in tests:
