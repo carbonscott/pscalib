@@ -39,6 +39,12 @@ import sys
 
 import numpy as np
 
+# --- machine-readable skip protocol (HYG-05); see tests/_skips.py -----------
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from _skips import skip  # noqa: E402
+
 # --- locate the pscalib package (parent of this tests dir) ------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG_PARENT = os.path.join(os.path.dirname(_HERE), "src")  # .../pscalib/src
@@ -253,9 +259,13 @@ def main():
     test_offline_apply_purity_subprocess()
 
     if not _have_psana():
-        print("\n[skip] psana not importable -- positive control (import "
-              "psana.dgram) skipped.  Source psconda.sh on sdfiana025.")
-        print("\nUS-007 offline checks PASSED (psana-dependent gate skipped)")
+        skip("us007_psana_positive_control",
+             "psana not importable -- the POSITIVE CONTROL (import psana.dgram "
+             "must trip the purity guard) did NOT run, so the guard is unproven "
+             "in the one direction that can fail open. Source psconda.sh on "
+             "sdfiana025.")
+        print("\nUS-007 offline checks PASSED (psana-dependent gate SKIPPED -- "
+              "see the ##SKIP## line above)")
         return
 
     test_positive_control_psana_dgram()

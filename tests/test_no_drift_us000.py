@@ -32,6 +32,12 @@ import numpy as np  # noqa: F401  (import-purity backdrop)
 import pytest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+# --- machine-readable skip protocol (HYG-05); see tests/_skips.py -----------
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from _skips import skip  # noqa: E402
+
 _PKG_PARENT = os.path.join(os.path.dirname(_HERE), "src")          # .../pscalib/src
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
@@ -89,10 +95,11 @@ def test_canonical_engine_import_is_framework_free():
     already = [m for m in pscalib.FORBIDDEN_MODULES
                if any(n == m or n.startswith(m + ".") for n in sys.modules)]
     if already:
-        msg = (f"in-proc purity skipped: sibling already imported {already}; "
-               f"the fresh-interpreter subprocess check (test_purity_us007) is "
-               f"authoritative")
-        print("[no-drift] " + msg)
+        msg = (f"sibling test already imported {already} into this interpreter, "
+               f"so an in-proc purity assertion here would be a false failure; "
+               f"the fresh-interpreter subprocess gate (test_purity_us007) is "
+               f"authoritative and still runs")
+        skip("us000_no_drift_inproc_purity_dirty_interpreter", msg)
         pytest.skip(msg)
     pscalib.assert_no_framework_imports()
     print("[no-drift] importing the pscalib engine stays framework-free")
