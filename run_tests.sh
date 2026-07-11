@@ -77,6 +77,7 @@ MANIFEST=(
   "test_cal12_forward_expiry.py"
   "test_gate01_randaccess_coverage.py"
   "test_gate03_nan_equality.py"
+  "test_gate05_retrieval_oracle.py"
   "test_runner_hygiene_hyg05.py"
 )
 
