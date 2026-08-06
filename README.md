@@ -112,6 +112,29 @@ map, a reused segment stack — live in your loop rather than in `pscalib`, and
 are written up with their bit-exactness arguments and their traps in
 **[docs/fast-event-loops.md](docs/fast-event-loops.md)**.
 
+### Tuning the fast jungfrau path (environment)
+
+The pure-numpy jungfrau apply path walks each segment in spatial row *tiles* and
+picks, per tile, between a dense two-plane blend and a sparse gather fixup. Both
+strategies are byte-exact, so the two knobs below change *speed only*, never the
+result — the bit gate proves equality across their whole sweep.
+
+- **`PSCALIB_CALIB_TILE_ROWS`** — rows per spatial tile. Integer, `1` to the
+  512-row jungfrau segment height (a larger value simply means one tile per
+  segment). **Default `512`**, i.e. one tile per 512×1024 segment; that is the
+  measured end-to-end optimum for the current kernel.
+- **`PSCALIB_CALIB_DENSE_FRAC`** — the tile-sized fraction of non-gain-0 pixels
+  *above* which a tile takes the dense blend instead of the sparse gather.
+  Float, `0.0`–`1.0`. **Default `0.60`**, tuned end to end. `0.0` forces the
+  dense blend on every tile and any value above `1.0` (e.g. `1e9`) forces the
+  gather on every tile — the two extremes the gate exercises.
+- Both are read **once, at import time**, into module-level constants of
+  `pscalib.apply._fastcalib`, so setting them *after* `import pscalib` has no
+  effect. Export them in the shell, or set `os.environ[...]` before the import.
+  `PSCALIB_CALIB_BACKEND` (`auto` / `numpy` / `reference`) is read once at
+  import time too; any other value is a hard `ValueError`, never a silent
+  fallback.
+
 ### Validity enforcement (refuse-by-default)
 
 Pass the run you are calibrating to enforce that the constants are valid for it

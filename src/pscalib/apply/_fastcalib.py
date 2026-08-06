@@ -1,17 +1,23 @@
-"""pscalib.apply._fastcalib -- the byte-exact fast machinery behind the apply leaves.
+"""pscalib.apply._fastcalib -- the fast numpy-only jungfrau calibration path.
+
+This module is the machinery behind
+:func:`pscalib.apply.jungfrau.calib_jungfrau`.  It computes, for every pixel,
+LITERALLY the reference expression
+
+    ``((raw & MSK).astype(f32) - poff[stage]) * gfac[stage] * mask.astype(f32)``
+
+with the reference's operation order and its THREE separate float32 roundings,
+so its output is byte-identical to the reference's -- including the sign of
+every zero and every NaN payload -- while doing far less work per event.
 
 NUMPY IS THE ONLY BACKEND.  There is no JIT, no ahead-of-time compiler and no
 compiled extension of any kind here -- not even behind a ``try/except`` -- so
-``import pscalib`` needs numpy and the python stdlib and nothing else.  An
-earlier revision of this file carried an OPTIONAL fused JIT kernel; it was
-DELETED for the numpy-only jungfrau cube campaign (branch
-``cand/calib-numpy-8x``), which forbids every compiled accelerator anywhere
-under ``src/``.  ``PSCALIB_CALIB_BACKEND`` therefore accepts ``auto``, ``numpy``
-and ``reference``; ANY other value raises ``ValueError`` naming the value asked
-for, and never falls back silently, because a silent fallback would mislabel a
-measurement.
+``import pscalib`` needs numpy and the python stdlib and nothing else.
+``PSCALIB_CALIB_BACKEND`` accepts ``auto``, ``numpy`` and ``reference``; ANY
+other value raises ``ValueError`` naming the value asked for, and never falls
+back silently, because a silent fallback would mislabel a measurement.
 
-This module holds TWO things, neither of which changes a single output bit:
+Two things carry the speedup, and neither changes a single output bit:
 
 1. **The memo (the hoist).**  ``poff = pedestals + pixel_offset``,
    ``gfac = 1/pixel_gain`` and the default status mask are pure functions of the
@@ -29,11 +35,12 @@ This module holds TWO things, neither of which changes a single output bit:
    held ONLY to derived arrays, never to sources.  (``WeakKeyDictionary`` is not
    an option: ``ndarray.__hash__`` is ``None``.)
 
-2. **The pure-numpy hybrid kernel.**  Per spatial tile, one of three strategies
-   is chosen from ONE cheap pass over that tile.  The classifier is the boolean
-   ``sel = (tile >= 0x4000)`` and its ``count_nonzero``; the SAME buffer is then
-   reused as the residual selector and as the dense/sparse decision, so nothing
-   is scanned twice:
+2. **The tile loop (the pure-numpy hybrid kernel).**  Each segment is walked in
+   spatial row tiles of :data:`TILE_ROWS` rows, and per tile one of three
+   strategies is chosen from ONE cheap pass over that tile.  The classifier is
+   the boolean ``sel = (tile >= 0x4000)`` and its ``count_nonzero``; the SAME
+   buffer is then reused as the residual selector and as the dense/sparse
+   decision, so nothing is scanned twice:
 
      A. ``count == 0`` -- no pixel has any bit above bit 13, so every gain code
         is 0 AND ``raw & 0x3fff == raw``: the whole tile is stage 0 and the
@@ -66,15 +73,28 @@ This module holds TWO things, neither of which changes a single output bit:
    EXACTLY the older ``hi == 0x4000`` (both say "no bit above bit 14 is set
    anywhere in this tile", i.e. only stages 0 and 1 are present).
 
-   Both branches evaluate, for every pixel, LITERALLY the reference expression
-   ``((raw & MSK).astype(f32) - poff[stage]) * gfac[stage] * mask.astype(f32)``
-   with the reference's operation order and its THREE separate float32
+   Both branches evaluate the expression at the top of this docstring for every
+   pixel, in the reference's operation order and with its three float32
    roundings -- EXCEPT that, when :func:`fold_is_exact` says it is a theorem,
    the last two multiplies are pre-composed into ``gfm = gfac * mask`` once per
    (gain, mask) pair and the per-tile ``t *= mask`` disappears (see
    :func:`fold_is_exact` for the proof and the fail-closed guard).  The path
    choice depends only on the frame's own contents, so it is invariant under any
    event partition; blocking is over SPATIAL axes only.
+
+Two environment knobs tune the tile loop.  BOTH ARE READ ONCE, AT IMPORT TIME,
+into module constants, so setting them after ``import pscalib`` has no effect:
+
+  * ``PSCALIB_CALIB_TILE_ROWS`` (int, default 512) -> :data:`TILE_ROWS`: rows
+    per spatial tile.
+  * ``PSCALIB_CALIB_DENSE_FRAC`` (float, default 0.60) -> :data:`DENSE_FRAC`:
+    the per-tile non-G0 fraction above which strategy B is taken instead of C.
+    ``0.0`` forces B on every tile; any value above 1 forces C on every tile.
+
+Both are SPEED-ONLY -- the output is byte-identical at every setting, which the
+bit gate checks over tile_rows {32, 128, 512} x dense_frac {0.0, 0.60, 1e9}.
+See :data:`TILE_ROWS` and :data:`DENSE_FRAC` for the measurements behind the
+two defaults.
 
 Traps that are deliberately respected here (each one has already bitten):
 
@@ -758,11 +778,7 @@ def check_out_buffer(out, shape, dtype=np.float32, name="out"):
 
 def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
                         mask=None, tile_rows=None, dense_frac=None,
-                        backend=None, hoist=True, out=None, block_cols=None):
-    # ``block_cols`` is accepted and IGNORED.  It used to select a per-column
-    # block dispatch inside the deleted fused kernel; the argument is kept so the
-    # campaign's existing sweep scripts still run (and now simply report the
-    # numpy hybrid's number for every value).
+                        backend=None, hoist=True, out=None):
     """Bit-identical fast twin of ``pscalib.apply.jungfrau.calib_jungfrau``.
 
     The extra keyword arguments are tuning / diagnostic knobs only; the public
@@ -825,16 +841,16 @@ def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
         #     routes to calib_jungfrau_reference one level up and never reaches
         #     here); running the hybrid for it would mislabel the result too.
         raise ValueError(
-            "backend=%r is not available.  The pure-numpy hybrid is the ONLY "
-            "compute backend pscalib has: there is no JIT and no compiled "
-            "extension anywhere under src/ (branch cand/calib-numpy-8x, the "
-            "numpy-only jungfrau cube campaign, forbids every compiled "
-            "accelerator).  Use 'numpy', or 'auto', which means the same thing. "
-            "For the verbatim c5ce538 expression set "
-            "PSCALIB_CALIB_BACKEND=reference or call "
-            "pscalib.apply.jungfrau.calib_jungfrau_reference directly.  This "
-            "raises instead of falling back so that a measurement cannot be "
-            "mislabelled." % (backend,))
+            "backend=%r is not a pscalib compute backend.  Valid values are "
+            "'numpy' (the tiled pure-numpy hybrid, which is the only compute "
+            "backend pscalib has), 'auto' (an alias for 'numpy'), and "
+            "'reference' (the verbatim reference expression; select it with "
+            "PSCALIB_CALIB_BACKEND=reference, or call "
+            "pscalib.apply.jungfrau.calib_jungfrau_reference directly).  "
+            "pscalib contains no JIT and no compiled extension, so there is no "
+            "accelerator to select; this raises instead of falling back to "
+            "numpy so that a timing measurement cannot be mislabelled."
+            % (backend,))
 
     # ---- SIGNED / non-unsigned raw: route to the verbatim reference ------
     # The reference classifies the gain code as ``(arr >> 14).astype(np.uint8)``,
@@ -845,10 +861,10 @@ def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
     # set nor the gather fixup and silently keeps its stage-0 base value -- an
     # error of order 3e4 ADU, not a sign-of-zero.
     # Real jungfrau raw is uint16 (the dataset, the fixture and the public
-    # docstring all say so), so this was latent and no measured number in this
-    # campaign is affected -- but the pure-numpy path is the byte-exact
-    # fallback and must stay one.  Deferring to the reference closes the
-    # exactness gap by construction.
+    # docstring all say so), so this was latent and no measured number is
+    # affected -- but the pure-numpy path is the byte-exact fallback and must
+    # stay one.  Deferring to the reference closes the exactness gap by
+    # construction.
     if raw.dtype.kind != "u":
         from .jungfrau import calib_jungfrau_reference
         res = calib_jungfrau_reference(raw, ped_src, gain_src,

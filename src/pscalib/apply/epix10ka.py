@@ -447,7 +447,7 @@ def _mask_from_pixel_status_segmented(ps, status_bits, gain_range_inds):
     ``merge_mask_for_grinds`` repeats the trick once per extra gain range.  Every
     step of that pipeline is ELEMENTWISE along the segment axis, so doing it one
     segment at a time yields the SAME BYTES while bounding the transient peak to
-    ~1/n_segments of it.  (The campaign gate asserts byte equality against the
+    ~1/n_segments of it.  (The bit gate asserts byte equality against the
     whole-array derivation rather than trusting this argument.)
 
     The verbatim helpers are CALLED here on a ``(n_ranges, 1, rows, cols)`` slab
