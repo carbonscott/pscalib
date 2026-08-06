@@ -105,6 +105,64 @@ This exists for per-event loops, where first-touching a fresh 67 MB output on
 every event is a measurable cost. `out=` changes *where* the result is written,
 never *what* is computed, and `out=None` — every existing call — is unaffected.
 
+Three things are yours to get right, and the first is the one that bites:
+
+- **The returned array *is* your buffer, so the next call overwrites it.** Never
+  put the result on a queue, hand it to another thread, or keep it in a list for
+  later without copying — you would be keeping N references to one buffer that
+  holds only the latest event. Use one buffer per concurrent consumer.
+- A buffer that may share memory with `raw` or with any constants array is
+  **refused** (`pedestals[0]` otherwise passes every dtype/shape check and the
+  calibration would overwrite the pedestals it is still reading).
+- Exactly `numpy.ndarray`, exactly `float32`, exactly `raw.shape`, writeable. A
+  subclass (`np.ma.MaskedArray`) is refused rather than silently stripped of its
+  mask, and any mismatch raises rather than being ignored.
+
+### The derived-constants cache — four rules
+
+The fast jungfrau path caches the derived constant planes — `poff = pedestals +
+pixel_offset`, `gfac = 1/pixel_gain`, and the folded `gfac × mask` — across
+calls. That hoist is where most of the speedup comes from, and it is keyed on the
+**identity** of the arrays you pass. Four consequences, none of which the library
+can check for you:
+
+1. **Never mutate a constants array in place.** Identity is not contents:
+   `pedestals[0] += 1` between two events does *not* invalidate the cache, and the
+   next event is calibrated with the pre-mutation constants — a measured max abs
+   error of 15117 ADU that is silently *exactly* the previous answer. Detecting it
+   would mean content-hashing 201 MB per event, which costs more than the
+   calibration. Build a new array, or call `pscalib.memo_clear()` right after
+   mutating (always safe: a dropped entry is re-derived bit for bit).
+2. **Pass ndarrays, and hold them for the run.** A `list`, a `tuple`, a Python
+   `float` or a numpy *scalar* cannot be weak-referenced, so it bypasses the cache
+   entirely and is re-derived every event (BYO lists: ~1300 ms/event, zero
+   amortisation). `pixel_offset` must be an array or `None` — `pixel_offset=0.0`
+   is arithmetically identical and about **2× the per-event cost**, because `None`
+   skips the derivation altogether. A provider that returns a *fresh* array per
+   event defeats the cache the same way.
+3. **The cache is unbounded.** No LRU, no cap: an entry lives until its source
+   array dies. Per jungfrau constants set —
+
+   | Constants as handed in | Planes cached | Held |
+   |---|---|---:|
+   | float32, `pixel_offset=None` (the default) | `gfac`, `gfac×mask` | 403 MB |
+   | float32, with a `pixel_offset` | `poff`, `gfac`, `gfac×mask` | 604 MB |
+   | float64 (or any non-float32) | both constants as float32, plus `poff`, `gfac`, `gfac×mask`, `mask` | 1074 MB |
+
+   N live constants sets cost N times that.
+4. **Calling from several threads is safe**; concurrent cold callers serialise
+   inside the cache instead of each deriving their own copy, and the result is
+   bit-identical either way. The counters are *advisory* (not atomic), and
+   `memo_clear()` has no post-condition while another thread is calling in.
+
+```python
+import pscalib
+pscalib.memo_nbytes()   # bytes of derived planes held alive
+pscalib.memo_size()     # live entries
+pscalib.memo_stats()    # {'miss':…, 'hit':…, …} — advisory, single-threaded asserts only
+pscalib.memo_clear()    # drop everything; always safe, never changes an output bit
+```
+
 Reusing the buffer is one of five caller-side moves that together take a
 jungfrau event loop from 116.1 to 76.9 ms/event with a **bit-identical** result.
 The other four — a prefetch thread, an all-finite fast path, a deferred `nvalid`

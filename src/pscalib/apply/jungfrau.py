@@ -39,6 +39,13 @@ from ._fastcalib import (                       # noqa: F401
     calib_jungfrau_fast as _calib_jungfrau_fast,
     backend_info,
     check_out_buffer as _check_out_buffer,
+    check_mask_shape as _check_mask_shape,
+    # Re-exported ON PURPOSE (not used in this module): the constants-cache
+    # contract that :func:`calib_jungfrau` documents below is unenforceable, so
+    # its escape hatch and its diagnostics have to be reachable from the same
+    # place a reader finds the contract.  Also re-exported from
+    # :mod:`pscalib.apply` and from :mod:`pscalib`.
+    memo_clear, memo_stats, memo_size, memo_nbytes, last_call,
 )
 
 #: 14-bit ADC mask -- psana ``UtilsJungfrau.MSK`` (``0x3fff``, ``(1<<14)-1``).
@@ -130,6 +137,13 @@ def calib_jungfrau_reference(raw, pedestals, pixel_gain,
         raise ValueError(
             f"pedestals leading axis must be {N_GAIN_STAGES} gain stages; "
             f"got shape {pedestals.shape}")
+    # A mask must be per-segment 3-D on BOTH routes, so that the two backends
+    # agree about what a mask IS.  This validates, it does not compute: for every
+    # mask of the documented shape the expression below is untouched.  (Without
+    # it this route does not raise for a 2-D mask -- ``np.asarray(mask)[s]``
+    # takes ROW s and broadcasts it over the whole segment, which is not masking.)
+    if mask is not None:
+        _check_mask_shape(mask, raw.shape)
 
     # poff = pedestals + pixel_offset  (offset absent -> 0)
     if pixel_offset is None:
@@ -152,7 +166,13 @@ def calib_jungfrau_reference(raw, pedestals, pixel_gain,
     if out is None:
         out = np.zeros(raw.shape, dtype=np.float32)
     else:
-        out = _check_out_buffer(out, raw.shape)
+        out = _check_out_buffer(
+            out, raw.shape,
+            no_alias=(("raw", raw), ("pedestals", pedestals),
+                      ("pixel_gain", pixel_gain),
+                      ("pixel_offset", pixel_offset), ("mask", mask),
+                      ("the derived poff", poff),
+                      ("the derived gfac", gfac)))
     for s in range(nseg):
         arr = raw[s]                                    # (512,1024) uint16
         # gain bits: 00/01/11 select stages 0/1/2; 10 (==2) is the bad code.
@@ -217,7 +237,55 @@ def calib_jungfrau(raw, pedestals, pixel_gain, pixel_offset=None, mask=None,
     hybrid writes straight into it, and the ``reference`` backend fills it -- so
     ``PSCALIB_CALIB_BACKEND=reference`` keeps working with a buffer.  The output
     is BIT-IDENTICAL with and without it (every element is assigned either way);
-    a buffer of the wrong dtype/shape RAISES rather than being ignored.
+    a buffer of the wrong dtype/shape RAISES rather than being ignored, as does
+    one that may share memory with ``raw`` or with any of the constants.  Two
+    things about it are the caller's problem: the returned array IS ``out``, so
+    THE NEXT CALL OVERWRITES IT -- never hand the result to a queue, a thread or
+    a deferred consumer without copying (``docs/fast-event-loops.md``) -- and
+    exactly one buffer per concurrent caller.
+
+    Constants contract (the memo)
+    -----------------------------
+    ``poff = pedestals + pixel_offset``, ``gfac = 1/pixel_gain`` and the
+    ``gfm = gfac * mask`` fold are cached across calls, keyed on the IDENTITY of
+    the arrays you pass.  That is where the speedup comes from, and it asks four
+    things of the caller which the library cannot check for you:
+
+    * **Do not mutate a constants array in place.**  Identity is not contents:
+      ``pedestals[0] += 1`` between two calls does NOT invalidate the cache, and
+      the next call is calibrated with the PRE-mutation constants (a measured max
+      abs error of 15117 ADU on the reference dataset, silently equal to the
+      previous answer).  Detecting it would mean content-hashing 201 MB per
+      event.  Build a new array instead -- or call
+      :func:`pscalib.apply.memo_clear` right after mutating, which is the
+      supported escape hatch and always safe (a dropped entry is re-derived bit
+      for bit).
+    * **Pass ndarrays, and keep them alive.**  A ``list``, a ``tuple``, a python
+      ``float`` or a numpy SCALAR cannot be weak-referenced, so it bypasses the
+      cache entirely and is re-derived on EVERY event (measured: BYO lists cost
+      ~1300 ms/event with zero amortisation).  ``pixel_offset`` must be an array
+      or ``None`` -- ``pixel_offset=0.0`` is arithmetically the same and about
+      2x the per-event cost, because ``None`` skips the derivation altogether.
+      A provider that returns a FRESH array per event defeats the cache the same
+      way: hold one constants set for the run.
+    * **The cache is unbounded.**  Entries live until their source array dies.
+      One jungfrau constants set holds 403 MB with ``pixel_offset=None``, 604 MB
+      with an offset, up to 1074 MB if the constants arrive as float64; N live
+      sets cost N times that.  :func:`pscalib.apply.memo_nbytes` reports it,
+      :func:`pscalib.apply.memo_clear` drops it, and
+      :func:`pscalib.apply.memo_stats` / :func:`pscalib.apply.memo_size` are the
+      other two diagnostics.  The counters are ADVISORY (not atomic).  All four
+      are re-exported at the top level too (``pscalib.memo_clear`` and friends),
+      exactly as ``pscalib.calib_jungfrau`` is.
+    * **Threading.**  Calling this from several threads is safe and produces
+      identical bits; concurrent cold callers serialise inside the cache's miss
+      path rather than each deriving their own copy.  See
+      ``docs/fast-event-loops.md`` for the full threading contract of the
+      recommended prefetch loop.
+
+    ``mask=`` must be per-segment 3-D, ``(S, rows, cols)`` with ``S`` at least
+    the segment count of ``raw``; a 2-D mask RAISES on both backends rather than
+    being broadcast row-wise, which is what it would silently mean.
 
     See :func:`calib_jungfrau_reference` for the full parameter documentation.
     """

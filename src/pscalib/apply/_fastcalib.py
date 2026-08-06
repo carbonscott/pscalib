@@ -19,12 +19,24 @@ back silently, because a silent fallback would mislabel a measurement.
 
 Two things carry the speedup, and neither changes a single output bit:
 
-1. **The memo (the hoist).**  ``poff = pedestals + pixel_offset``,
-   ``gfac = 1/pixel_gain`` and the default status mask are pure functions of the
-   *calibration constants*, which are fetched once per run -- yet the c5ce538
-   apply path rebuilt all three on EVERY event.  ``mask_from_pixel_status``
-   alone was 45-56% of the whole per-event calib cost.  :func:`memo` caches them
-   keyed on the IDENTITY of the source arrays.
+1. **The memo (the hoist).**  ``poff = pedestals + pixel_offset`` and
+   ``gfac = 1/pixel_gain`` are pure functions of the *calibration constants*,
+   which are fetched once per run -- yet the c5ce538 apply path rebuilt both
+   (two 201 MB arrays) on EVERY event.  :func:`memo` caches them, and the
+   ``gfm = gfac * mask`` fold of item 2 along with them, keyed on the IDENTITY
+   of the source arrays.
+
+   WHAT THIS MODULE DOES **NOT** HOIST: the default status mask.  Building that
+   really is 45-56% of the whole per-event calib cost, but the builder
+   (:func:`pscalib.apply.epix10ka.mask_from_pixel_status`) lives in another
+   module and never touches this one, so nothing here caches it.  The hoist for
+   it is one level up, in ``pscalib.registry._hoisted_status_mask``, which calls
+   :func:`memo` itself and keys on the ``pixel_status`` constant; the PUBLIC
+   ``mask_from_pixel_status`` is deliberately left un-memoised so a caller who
+   mutates its result is unaffected.  A caller who assembles a ``mask=`` of
+   their own therefore gets NO hoisting of that step from here -- they must hold
+   the mask object across events themselves, and the identity of the object they
+   hold is what keys the ``gfm`` fold.
 
    Keying on a bare ``id()`` is UNSOUND: CPython recycles addresses, so a freed
    array's id can be handed to a different array and a bare-id cache would
@@ -82,6 +94,52 @@ Two things carry the speedup, and neither changes a single output bit:
    choice depends only on the frame's own contents, so it is invariant under any
    event partition; blocking is over SPATIAL axes only.
 
+THE MEMO'S CONTRACT.  Every clause below is on the CALLER's side of the line:
+none of them can be enforced here without giving up the very speedup the memo
+exists for.  The user-facing statement of the same five clauses lives in the
+PUBLIC :func:`pscalib.apply.jungfrau.calib_jungfrau` docstring and in
+``README.md``; the mechanism is :func:`memo`.
+
+  * **Never mutate a constants array in place.**  The memo keys on an array's
+    IDENTITY, not on its contents, so ``pedestals[0] += 1`` between two events
+    does NOT invalidate the cached ``poff`` / ``gfac`` / ``gfm``: the second
+    event is silently calibrated with the PRE-mutation constants (measured max
+    abs error 15117 ADU on the real fixture -- and it equals the pre-mutation
+    answer exactly, so nothing looks wrong).  Enforcing this would mean
+    content-hashing 201 MB of constants per event, which costs more than the
+    calibration it protects.  Build a NEW array, or call :func:`memo_clear`
+    after mutating.
+  * **Pass ndarrays, and hold them.**  The memo can only amortise across events
+    what it can weak-reference and then re-recognise.  A source that cannot be
+    weak-referenced -- a ``list``, a ``tuple``, a python ``float``, a numpy
+    SCALAR -- silently bypasses the memo entirely and is re-derived on EVERY
+    event (``uncacheable`` counts it).  ``pixel_offset=0.0`` is the trap that
+    looks harmless: it costs about 2x per event versus ``pixel_offset=None``,
+    which is free.  So is a provider that hands back a FRESH array per event:
+    every event gets a new ``id()``, hits nothing, and inserts another entry.
+  * **The memo is UNBOUNDED.**  There is no LRU and no cap; an entry lives until
+    its source array dies, at which point a weakref callback pops it.  ONE
+    jungfrau constants set holds 403 MB with ``pixel_offset=None``, 604 MB with
+    an offset, and up to 1074 MB when the constants arrive as float64 -- see
+    :func:`memo_nbytes` for the table and the arithmetic.  N live constants sets
+    cost N times that.  :func:`memo_nbytes` measures it, :func:`memo_clear`
+    drops it.
+  * **Concurrency: correct, deliberately coarse.**  The HIT path is lock-free (a
+    dict lookup, atomic under the GIL).  The MISS path takes ``_MEMO_LOCK`` and
+    RE-CHECKS the key under it, so N threads arriving cold on the same key
+    derive it ONCE and the other N-1 take the hit instead of each building their
+    own 201 MB copy (the un-serialised version measured a 94 MB transient peak
+    at 1 thread growing to 791 MB at 16).  Misses therefore serialise against
+    misses.  No output bit depends on any of this: the derivation is a pure
+    function of the sources, and 0 byte-divergent threads were observed over
+    8 threads x 5 trials.
+  * **The counters are ADVISORY.**  ``_STATS[k] += 1`` is not atomic; it is
+    incidentally lossless on CPython 3.12 (0 lost of 160,000 measured) only
+    because of the GIL, and a free-threaded build would drop counts.  Assert on
+    :func:`memo_stats` in a single-threaded test, never as a concurrent
+    invariant.  :func:`memo_clear` likewise has no post-condition under
+    concurrency -- see its docstring.
+
 Two environment knobs tune the tile loop.  BOTH ARE READ ONCE, AT IMPORT TIME,
 into module constants, so setting them after ``import pscalib`` has no effect:
 
@@ -118,7 +176,11 @@ Traps that are deliberately respected here (each one has already bitten):
     Operand order is identical to the reference in every multiply.
   * SINGLE-THREADED.  Plain numpy ufuncs on one thread, no thread pool, no
     ``concurrent.futures``, no BLAS call.  A hidden thread would manufacture a
-    fake speedup at workers=1.
+    fake speedup at workers=1.  THIS IS ABOUT THE KERNEL'S OWN THREAD USE, NOT
+    ABOUT CALLER CONCURRENCY -- it does not say the entry point may only be
+    called from one thread.  The caller-facing threading contract is the
+    concurrency clause of THE MEMO'S CONTRACT above (and, for the prefetch
+    pattern that motivates the question, ``docs/fast-event-loops.md``).
 
 The reference this is written against is pscalib c5ce538,
 ``pscalib.apply.jungfrau.calib_jungfrau`` (preserved verbatim as
@@ -127,15 +189,18 @@ The reference this is written against is pscalib c5ce538,
 """
 
 import os
+import threading
 import weakref
 
 import numpy as np
 
 __all__ = [
     "MSK", "BSH", "N_GAIN_STAGES",
-    "memo", "memo_clear", "memo_stats", "memo_size",
+    "memo", "memo_clear", "memo_stats", "memo_size", "memo_nbytes",
     "derive_poff", "derive_gfac", "derive_gfm", "fold_is_exact",
+    "effective_tile_rows", "check_out_buffer", "check_mask_shape",
     "calib_jungfrau_fast", "backend_info",
+    "LAST_CALL", "LAST_CALL_KEYS", "last_call",
 ]
 
 #: 14-bit ADC mask -- psana ``UtilsJungfrau.MSK``.
@@ -193,9 +258,15 @@ TILE_ROWS = _env_int("PSCALIB_CALIB_TILE_ROWS", 512)
 #:   dense_frac 0.02   0.15   0.35   0.60
 #:   mean ms    60.72  56.88  52.50  50.92     <- 0.60 wins
 #: and the same ordering holds at every synthetic fraction, so 0.60 is adopted.
-#: Byte-exactness is threshold-INDEPENDENT: the gate forces dense-on-every-tile
-#: (0.0) and gather-on-every-tile (1e9) and both are byte-exact on all 8 real
-#: frames, so any per-tile mixture of the two is byte-exact too.
+#: Byte-exactness is threshold-INDEPENDENT, but state what the gate actually
+#: proves rather than more: at 0.0 every tile that HAS a non-G0 pixel takes the
+#: dense blend and at 1e9 every such tile takes the gather, and both are
+#: byte-exact against the reference on all 8 real frames.  A tile with NO non-G0
+#: pixel is case A in BOTH configs -- ``thr`` is never consulted for it -- so the
+#: threshold sweep does not cross-check case A against its siblings; case A is
+#: cross-checked against the REFERENCE, which is the oracle, on every gate run.
+#: Since each tile independently takes A, B or C and each of the three is
+#: byte-exact against the reference, any per-tile mixture of them is too.
 #: RE-MEASURED for the current kernel (job 34316936, sdfmilan253, tile_rows=128,
 #: mean ms/frame over the 8 real fixture frames):
 #:   dense_frac  0.02   0.10   0.20   0.35   0.60   1e9
@@ -218,14 +289,56 @@ _MEMO = {}
 _STATS = {"miss": 0, "hit": 0, "stale": 0, "evict": 0, "uncacheable": 0,
           "noncacheable_alias": 0}
 
+#: Serialises the memo's MISS path only (the hit path stays lock-free).
+#: ``RLock``, not ``Lock``: the miss path holds this across the caller's
+#: ``compute()`` callable, so a ``compute`` that memoised something itself would
+#: DEADLOCK on a plain lock.  None of the six callables in this repo does that
+#: today -- they are :func:`derive_poff`, :func:`derive_gfac`, :func:`derive_gfm`,
+#: :func:`fold_is_exact`, the ``as_f32`` / ``mask_f32`` conversions, and
+#: ``pscalib.registry._hoisted_status_mask``'s ``mask_from_pixel_status`` -- so
+#: the reentrancy is belt-and-braces against a future one, at no cost.
+#: The weakref eviction callback deliberately does NOT take this lock: it is a
+#: single ``dict.pop`` (atomic under the GIL) and it can fire from ANY thread at
+#: an arbitrary deallocation point, including inside a ``compute()`` that this
+#: lock is already held for.
+_MEMO_LOCK = threading.RLock()
+
 
 def memo_stats():
-    """Snapshot of the memo counters.  ``miss`` is the one to assert on."""
+    """Snapshot of the memo counters.  ``miss`` is the one to assert on.
+
+    Keys: ``miss`` (a derivation ran), ``hit`` (a cached value was returned),
+    ``stale`` (an entry was dropped because its source's ``id`` had been
+    recycled), ``evict`` (a source died and its entry was popped),
+    ``uncacheable`` (a source could not be weak-referenced, so the value was
+    returned uncached) and ``noncacheable_alias`` (the derived value shares
+    memory with a source, so caching it would pin the source -- see
+    :func:`memo`).
+
+    ADVISORY ONLY under concurrency: ``_STATS[k] += 1`` is not atomic and is
+    lossless on CPython 3.12 (0 lost of 160,000 measured) only by grace of the
+    GIL.  Assert on these in a single-threaded test; never treat them as a
+    concurrent invariant.
+    """
     return dict(_STATS)
 
 
 def memo_clear():
-    """Drop every memo entry and zero the counters."""
+    """Drop every memo entry and zero the counters.
+
+    This is the escape hatch for the two clauses of the memo's contract that
+    cannot be enforced (see the module docstring): after mutating a constants
+    array in place, and when the memo's unbounded footprint needs reclaiming
+    before the source arrays themselves are dropped.  It is always SAFE -- a
+    dropped entry is re-derived on the next call, bit for bit -- and never
+    changes an output bit.
+
+    NO POST-CONDITION UNDER CONCURRENCY.  A call that races another thread's
+    miss can return with that miss's entry already (re-)inserted, so
+    ``memo_size() == 0`` immediately afterwards is guaranteed only when no other
+    thread is calling in.  The counters are reset the same way, and the
+    increments are not atomic either (see :func:`memo_stats`).
+    """
     _MEMO.clear()
     for k in _STATS:
         _STATS[k] = 0
@@ -237,12 +350,55 @@ def memo_size():
 
 
 def memo_nbytes():
-    """Total bytes of DERIVED arrays the memo is holding alive."""
+    """Total bytes of DERIVED arrays the memo is holding alive.
+
+    The memo is UNBOUNDED -- no LRU, no cap -- so this is the number to watch.
+    An entry lives until its source array dies (a weakref callback then pops it),
+    which for constants held for a whole run means "the whole run".  For ONE
+    jungfrau constants set (``pedestals`` / ``pixel_gain`` / ``pixel_offset``
+    each ``(3, 32, 512, 1024)`` = 201.3 MB, ``mask`` ``(32, 512, 1024)`` =
+    67.1 MB):
+
+    ==========================  =========================================  ======
+    constants as handed in      entries cached                             total
+    ==========================  =========================================  ======
+    float32, ``pixel_offset``   ``gfac``, ``gfm``                          403 MB
+    ``None`` (the default)
+    float32, with an offset     ``poff``, ``gfac``, ``gfm``                604 MB
+    float64 (or any non-f32)    ``pedestals``, ``pixel_gain`` as float32,  1074 MB
+                                ``poff``, ``gfac``, ``gfm``, ``mask``
+    ==========================  =========================================  ======
+
+    N live constants sets cost N times that.  (The exotic-dtype row is
+    5 x 201.3 MB + 67.1 MB; it assumes an offset and a mask whose dtype does not
+    convert exactly to float32, i.e. the worst case.)  :func:`memo_clear` drops
+    the lot.
+
+    Iterates a ``list()`` SNAPSHOT of the entries on purpose: plain iteration
+    raises ``RuntimeError: dictionary changed size during iteration`` if another
+    thread inserts (or a weakref eviction fires) mid-walk -- in exactly the
+    helper you would reach for under memory pressure.
+    """
     tot = 0
-    for _refs, val in _MEMO.values():
+    for _refs, val in list(_MEMO.values()):
         if isinstance(val, np.ndarray):
             tot += val.nbytes
     return tot
+
+
+def _memo_entry_is_live(refs, sources):
+    """Do an entry's weakrefs still point at EXACTLY ``sources``?
+
+    ``False`` means the key's ``id``s have been recycled onto different objects,
+    i.e. the entry is stale and must not be returned.
+    """
+    for r, s in zip(refs, sources):
+        if r is None:
+            if s is not None:
+                return False
+        elif r() is not s:                # the id was recycled -> stale entry
+            return False
+    return True
 
 
 def memo(sources, tag, compute):
@@ -252,66 +408,107 @@ def memo(sources, tag, compute):
     hashable discriminator (put scalar parameters like ``status_bits`` in there,
     never in ``sources`` -- small ints are interned and their ids are useless).
 
-    If a source cannot be weak-referenced, or if the derived value IS one of the
-    sources, the result is returned WITHOUT being cached: caching the former
-    would mean keying on a bare id (unsound), and caching the latter would make
-    the memo hold a STRONG ref to a source array, pinning hundreds of MB forever
-    and defeating the weakref eviction.
+    The result is returned WITHOUT being cached in two cases, both of which
+    would otherwise break the eviction that makes an id key sound:
+
+    * a source cannot be weak-referenced -- caching would then mean keying on a
+      bare id, which is unsound because CPython recycles addresses;
+    * the derived value IS a source, or SHARES A BUFFER with one.  The ``is``
+      case is obvious (the memo would hold a strong ref to a source array).  The
+      sharing case is the same bug wearing a disguise, and it bit: a VIEW of an
+      ndarray SUBCLASS that owns its buffer -- ``np.asarray(memmap, np.float32)``
+      is exactly that -- keeps the source alive through its C-level ``.base``
+      slot, so the weakref can NEVER fire, ``gc`` cannot see the cycle, and the
+      entry is immortal.  Six memmap-backed runs leaked 302 MB monotonically
+      before ``np.may_share_memory`` was added to this guard; they leak 0.0 MB
+      after it, and plain-float32 callers keep the identical ``memo_size``, byte
+      count and hit pattern.
+
+    Threading: the hit path is lock-free (one dict lookup, atomic under the
+    GIL); the miss path takes ``_MEMO_LOCK`` and RE-CHECKS the key under it, so
+    concurrent cold callers on one key derive once instead of once each.  See
+    THE MEMO'S CONTRACT in the module docstring.
     """
     key = tuple(id(s) for s in sources) + (tag,)
     ent = _MEMO.get(key)
-    if ent is not None:
-        refs, val = ent
-        ok = True
-        for r, s in zip(refs, sources):
-            if r is None:
-                if s is not None:
-                    ok = False
-                    break
-            elif r() is not s:            # the id was recycled -> stale entry
-                ok = False
-                break
-        if ok:
-            _STATS["hit"] += 1
-            return val
-        _STATS["stale"] += 1
-        _MEMO.pop(key, None)
+    if ent is not None and _memo_entry_is_live(ent[0], sources):
+        _STATS["hit"] += 1
+        return ent[1]
 
-    _STATS["miss"] += 1
-    val = compute()
+    with _MEMO_LOCK:
+        # RE-CHECK under the lock.  Without this, N threads that miss together
+        # each run the full derivation and each transiently hold their own copy
+        # (a measured 94 MB peak at 1 thread against 791 MB at 16) -- wasted
+        # work, never a wrong answer, since compute() is a pure function of the
+        # sources.  A key that another thread filled while we waited is a HIT
+        # here, which is also what keeps the ``miss`` counter meaningful.
+        ent = _MEMO.get(key)
+        if ent is not None:
+            if _memo_entry_is_live(ent[0], sources):
+                _STATS["hit"] += 1
+                return ent[1]
+            _STATS["stale"] += 1
+            _MEMO.pop(key, None)
 
-    for s in sources:
-        if val is s:
-            _STATS["noncacheable_alias"] += 1
-            return val
+        _STATS["miss"] += 1
+        val = compute()
 
-    def _evict(_dead, _key=key):          # closes over ints only, no strong refs
-        _STATS["evict"] += 1
-        _MEMO.pop(_key, None)
+        for s in sources:
+            if val is s or (isinstance(val, np.ndarray)
+                            and isinstance(s, np.ndarray)
+                            and np.may_share_memory(val, s)):
+                _STATS["noncacheable_alias"] += 1
+                return val
 
-    refs = []
-    for s in sources:
-        if s is None:
-            refs.append(None)
-            continue
-        try:
-            refs.append(weakref.ref(s, _evict))
-        except TypeError:                 # not weak-referenceable -> do not cache
-            _STATS["uncacheable"] += 1
-            return val
-    _MEMO[key] = (tuple(refs), val)
-    return val
+        def _evict(_dead, _key=key):      # closes over ints only, no strong refs
+            _STATS["evict"] += 1
+            _MEMO.pop(_key, None)
+
+        refs = []
+        for s in sources:
+            if s is None:
+                refs.append(None)
+                continue
+            try:
+                refs.append(weakref.ref(s, _evict))
+            except TypeError:             # not weak-referenceable -> do not cache
+                _STATS["uncacheable"] += 1
+                return val
+        _MEMO[key] = (tuple(refs), val)
+        return val
 
 
 # ==========================================================================
 # 2. Derived constants (bit-identical to the reference's own derivation)
 # ==========================================================================
 def _as_f32(src):
-    """``np.asarray(src, np.float32)``, hoisted when it actually converts."""
-    a = np.asarray(src, dtype=np.float32)
-    if a is src:
-        return a
-    return memo((src,), "as_f32", lambda: a)
+    """``np.asarray(src, np.float32)``, hoisted when it actually converts.
+
+    LAZY, and that is the whole point.  ``np.asarray`` returns ``src`` ITSELF --
+    no copy, no allocation, no work -- exactly when ``src`` is a BASE
+    ``numpy.ndarray`` whose dtype is already float32.  That predicate is exact,
+    not conservative: ``asarray`` is ``np.array(..., copy=False, subok=False)``,
+    so it copies for a dtype change (including a byte-swapped ``>f4``, which
+    compares unequal to ``np.float32``) and returns a base-class VIEW for an
+    ndarray SUBCLASS, but it never forces contiguity -- a strided float32
+    ndarray comes back unchanged, which is why C-contiguity must NOT be part of
+    the test (verified on numpy 1.26.4).
+
+    That free case is answered here WITHOUT consulting the memo.  Going through
+    the memo for it would derive a value that IS the source, which the alias
+    guard then correctly refuses to cache -- forever -- so every event would burn
+    a ``miss`` on the very counter :func:`memo_stats` tells callers to assert on,
+    and a working memo would be indistinguishable from a broken one.
+
+    Every other case goes through the memo with the conversion INSIDE
+    ``compute``, so a HIT never converts.  Calling ``np.asarray`` before the
+    lookup (as this used to) paid a full 201 MB float64 -> float32 conversion on
+    every single event and threw the result away on the hit -- a 2-4x per-event
+    regression for non-float32 constants that the ``miss`` counter could not see.
+    """
+    if type(src) is np.ndarray and src.dtype == np.dtype(np.float32):
+        return src
+    return memo((src,), "as_f32", lambda: np.asarray(src, dtype=np.float32))
 
 
 def derive_poff(pedestals, pixel_offset):
@@ -385,6 +582,30 @@ def _prep_mask(mask, hoist):
 #: :func:`pscalib.apply.jungfrau.calib_jungfrau`, and never reaches this module.
 COMPUTE_BACKENDS = ("numpy",)
 
+#: The jungfrau segment height.  Only used to report an EFFECTIVE tile height in
+#: :func:`backend_info`, which has no frame in hand: the clamp needs one.
+SEGMENT_ROWS = 512
+
+
+def effective_tile_rows(tile_rows, nrows):
+    """The tile height the kernel will ACTUALLY walk an ``nrows``-row segment in.
+
+    The kernel CLAMPS, and reporting the unclamped request mislabels a
+    measurement: a request of ``0``, of a negative number, or of anything taller
+    than the segment all mean ONE TILE PER SEGMENT.  ``backend_info()`` and
+    ``LAST_CALL`` therefore report what comes out of here, not what went in.
+
+    The floor of 1 is for a ZERO-EXTENT segment (``nrows == 0``), which the
+    reference calibrates into an empty array without complaint: the clamp would
+    otherwise hand ``range(0, 0, 0)`` a step of 0 and raise ``ValueError:
+    range() arg 3 must not be zero``.  With ``nrows == 0`` the tile loop simply
+    does not execute, which is the right answer.
+    """
+    step = int(tile_rows)
+    if step <= 0 or step > nrows:
+        step = nrows
+    return step if step > 0 else 1
+
 
 def backend_info():
     """What the fast path will actually use, and why.
@@ -392,6 +613,14 @@ def backend_info():
     ``compute_backend`` is ALWAYS ``"numpy"``: the tiled pure-numpy hybrid of
     section 4 is the only kernel that exists.  ``backend`` echoes the
     ``PSCALIB_CALIB_BACKEND`` request (``auto`` / ``numpy`` / ``reference``).
+
+    ``tile_rows`` is the CONFIGURED request; ``tile_rows_effective`` is what the
+    kernel would really use for a ``tile_rows_effective_assumes_nrows``-row
+    segment (:data:`SEGMENT_ROWS`, the jungfrau geometry), after
+    :func:`effective_tile_rows` clamps it.  They differ exactly when the request
+    is unusable -- ``PSCALIB_CALIB_TILE_ROWS=-7`` reports ``tile_rows=-7`` and
+    ``tile_rows_effective=512``, so a timing cannot be labelled ``-7`` when it
+    actually ran one tile per segment.
     """
     return {
         "backend": BACKEND,
@@ -400,6 +629,8 @@ def backend_info():
         "kernel": "numpy_hybrid",
         "compiled_extensions": [],
         "tile_rows": TILE_ROWS,
+        "tile_rows_effective": effective_tile_rows(TILE_ROWS, SEGMENT_ROWS),
+        "tile_rows_effective_assumes_nrows": SEGMENT_ROWS,
         "dense_frac": DENSE_FRAC,
         "numpy_version": np.__version__,
     }
@@ -470,6 +701,14 @@ def fold_is_exact(poff, gfac, mprep, raw_dtype, lim=FOLD_LIM):
     """
     if np.dtype(raw_dtype).kind != "u":
         return False, "raw dtype %s is not unsigned" % np.dtype(raw_dtype)
+    if np.asarray(poff).size == 0 or np.asarray(gfac).size == 0:
+        # ZERO-EXTENT constants (a 0-row or 0-column segment, which the reference
+        # calibrates into an empty array without complaint).  ``abs(x).max()``
+        # below would raise "zero-size array to reduction operation maximum
+        # which has no identity", so decline the fold rather than crash: there is
+        # no pixel for it to be exact about, and the unfolded lane writes the
+        # same empty array.
+        return False, "poff or gfac is zero-extent: there is no pixel to fold"
     if not (np.isfinite(poff).all() and np.isfinite(gfac).all()):
         return False, "poff or gfac is not everywhere finite"
     mp = float(np.abs(poff).max())
@@ -600,8 +839,10 @@ def _hybrid_numpy(raw, poff, gfx, mprep, out, step, dense_frac, folded=False):
     it is exactly the flag that removes the per-tile ``t *= mask``.
     """
     nseg, nrows, ncols = raw.shape
-    if not step or step <= 0 or step > nrows:
-        step = nrows
+    # The clamp lives in ONE place so that what the census reports is what the
+    # loop below actually walks (and so that a zero-extent segment cannot hand
+    # ``range`` a step of 0 -- see :func:`effective_tile_rows`).
+    step = effective_tile_rows(step, nrows)
     p0a, p1a = poff[0], poff[1]
     g0a, g1a = gfx[0], gfx[1]
     # Scratch, allocated ONCE and reused by every tile so it stays hot in cache
@@ -614,9 +855,9 @@ def _hybrid_numpy(raw, poff, gfx, mprep, out, step, dense_frac, folded=False):
     adcb = np.empty((step, ncols), dtype=raw.dtype)
     x1b = np.empty((step, ncols), dtype=np.float32)
     selb = np.empty((step, ncols), dtype=np.bool_)
-    thr = dense_frac * step * ncols
     census = {"A_pure_g0": 0, "B_dense_blend": 0, "C_sparse_gather": 0,
-              "n_gathered": 0, "mask_folded": bool(folded)}
+              "n_gathered": 0, "mask_folded": bool(folded),
+              "tile_rows": int(step)}
     # The throwaway (non-G0) lanes of the stage-0 base pass evaluate things like
     # v - NaN and can overflow float32; numpy's default is to WARN.  Suppressing
     # the warning changes no value.
@@ -637,6 +878,18 @@ def _hybrid_numpy(raw, poff, gfx, mprep, out, step, dense_frac, folded=False):
                 t = osg[r0:r1]
                 mt = None if ms is None else ms[r0:r1]
                 p0t, g0t = p0s[r0:r1], g0s[r0:r1]
+                # The dense/sparse threshold is a FRACTION OF THIS TILE, so it
+                # must be scaled by this tile's own height ``h`` and not by the
+                # nominal ``step``.  A trailing PARTIAL tile (step does not
+                # divide nrows) is shorter than step, so a threshold built from
+                # step is too high for it and biases it permanently toward the
+                # sparse gather however dense it is.  Both branches are
+                # byte-exact, so this is a TUNING fix: it changes which branch a
+                # partial tile takes, never what it computes.  It is inert at the
+                # measured configuration -- tile_rows=512 divides the 512-row
+                # jungfrau segment exactly, so no partial tile exists there and
+                # h == step for every tile.
+                thr = dense_frac * h * ncols
 
                 # ONE pass over the tile does all THREE jobs: it classifies the
                 # tile, it counts for the dense/sparse decision, and it IS the
@@ -714,14 +967,104 @@ def _hybrid_numpy(raw, poff, gfx, mprep, out, step, dense_frac, folded=False):
 # ==========================================================================
 # 5. The entry point
 # ==========================================================================
-#: Diagnostics from the LAST call: the per-case tile census, which backend
-#: actually ran, the tile/threshold knobs in force, and -- ``mask_folded`` /
-#: ``fold_reason`` -- whether the ``gfm = gfac * mask`` fold was taken and, when
-#: it was not, the exact conjunct of :func:`fold_is_exact` that declined it.
+#: Diagnostics from the LAST call.  ADVISORY, not a return value: it is
+#: overwritten by the next call, from whichever thread makes it.
+#:
+#: EVERY key below is present after EVERY call, on BOTH routes -- the tiled
+#: kernel and the verbatim-reference fallback -- so a diagnostic consumer never
+#: has to guard a lookup:
+#:
+#:   * ``backend_used`` -- ``"numpy"`` or ``"reference"``.
+#:   * ``reference_reason`` -- why the reference route was taken; ``None`` on the
+#:     numpy route.
+#:   * ``A_pure_g0`` / ``B_dense_blend`` / ``C_sparse_gather`` -- the per-case
+#:     tile census.  All 0 on the reference route, which walks no tiles.
+#:   * ``n_gathered`` -- pixels rewritten by the sparse fixup (0 likewise).
+#:   * ``mask_folded`` / ``fold_reason`` -- whether the ``gfm = gfac * mask``
+#:     fold was taken and, when it was not, the exact conjunct of
+#:     :func:`fold_is_exact` that declined it.
+#:   * ``tile_rows`` -- the EFFECTIVE tile height the kernel walked, after
+#:     :func:`effective_tile_rows` clamped the request (``None`` on the reference
+#:     route, which does not tile); ``tile_rows_requested`` -- what was asked
+#:     for.  Reporting only the request mislabels a measurement.
+#:   * ``dense_frac`` -- the threshold in force.
+#:
+#: This dict object is never REBOUND (callers may hold a reference to it) and is
+#: never ``clear()``-ed: it is published with a single ``update()`` of a
+#: fully-built dict, so a reader on another thread sees the previous call's
+#: values or this one's, never an empty or half-filled dict.  A reader that wants
+#: a coherent set of keys should still take a snapshot -- :func:`last_call`.
 LAST_CALL = {}
 
 
-def check_out_buffer(out, shape, dtype=np.float32, name="out"):
+#: Every key :data:`LAST_CALL` advertises.  Both routes publish all of them, so
+#: a consumer never sees a KeyError and there is nothing stale for the missing
+#: ``clear()`` to leave behind.
+LAST_CALL_KEYS = (
+    "backend_used", "reference_reason",
+    "A_pure_g0", "B_dense_blend", "C_sparse_gather", "n_gathered",
+    "mask_folded", "fold_reason",
+    "tile_rows", "tile_rows_requested", "dense_frac",
+)
+
+
+def _publish_last_call(info):
+    """Publish one call's diagnostics into :data:`LAST_CALL`, atomically enough.
+
+    Never REBINDS the global (callers may hold a reference to the dict object)
+    and never ``clear()``s it: a ``clear()`` followed by an ``update()`` is
+    observable in between -- 89k empty and 184k partial reads were measured at a
+    1 us switch interval -- whereas a single ``update()`` of a FULLY BUILT dict
+    leaves a reader with either the previous call's values or this one's.  It is
+    safe to drop the ``clear()`` precisely because every route fills every
+    advertised key, so there is no stale key to evict; that is asserted here
+    rather than trusted.
+    """
+    missing = [k for k in LAST_CALL_KEYS if k not in info]
+    if missing:                           # a programming error, not user input
+        raise AssertionError(
+            "LAST_CALL would be published without the advertised key(s) %s; "
+            "every route must fill all of %s" % (missing, list(LAST_CALL_KEYS)))
+    LAST_CALL.update(info)
+
+
+def last_call():
+    """A snapshot COPY of :data:`LAST_CALL` (which the next call overwrites)."""
+    return dict(LAST_CALL)
+
+
+def check_mask_shape(mask, raw_shape, name="mask"):
+    """Validate a ``mask=`` the tiled kernel can index per segment; RAISE or None.
+
+    The mask must be PER-SEGMENT 3-D, ``(S, rows, cols)`` with the same
+    ``(rows, cols)`` as ``raw`` and ``S >= raw.shape[0]``: the reference indexes
+    it as ``mask[s]`` for every segment ``s`` in ``raw``, and the kernel slices
+    ``mask[s][r0:r1]`` per tile.
+
+    A 2-D ``(rows, cols)`` mask -- the shape someone reaches for with a
+    single-panel detector in mind -- is refused HERE, naming both shapes, because
+    neither path does anything defensible with it.  The kernel raises
+    ``ValueError: operands could not be broadcast together with shapes (512,1024)
+    (512,) (512,1024)``, which names no useful shape; the reference does not
+    raise at all -- ``np.asarray(mask)[s]`` takes ROW ``s`` of the mask and
+    broadcasts that one row across the whole segment, i.e. it silently computes
+    something nobody asked for.  A clear refusal is better than either.
+    """
+    m = np.asarray(mask)
+    want = tuple(int(x) for x in raw_shape)
+    if m.ndim != 3 or m.shape[1:] != want[1:] or m.shape[0] < want[0]:
+        raise ValueError(
+            "%s= has shape %s but must be per-segment 3-D (S, %d, %d) with "
+            "S >= %d, the segment count of raw %s: the calibration indexes it "
+            "as %s[s] for every segment s of raw.  A 2-D (rows, cols) %s is NOT "
+            "broadcast over the segments -- %s[s] would take ROW s of it -- so "
+            "it is refused rather than silently misapplied; pass "
+            "np.broadcast_to(%s, %s) explicitly if that is really what you "
+            "want." % (name, m.shape, want[1], want[2], want[0], want, name,
+                        name, name, name, want))
+
+
+def check_out_buffer(out, shape, dtype=np.float32, name="out", no_alias=()):
     """Validate a caller-supplied ``out=`` buffer; return it, or RAISE.
 
     The whole point of ``out=`` is that the caller reuses ONE 67 MB buffer
@@ -732,17 +1075,34 @@ def check_out_buffer(out, shape, dtype=np.float32, name="out"):
     stale data from the previous event -- a WRONG cube, with no error anywhere.
     So every mismatch is a hard error naming what was expected and what came.
 
-    Requirements, all checked:
+    Requirements, all checked here (and ``no_alias`` is what makes the last one
+    true rather than merely claimed):
 
-    * a real ``numpy.ndarray`` (not a list, not a memoryview) -- the kernel
-      writes into it with basic slicing and ``ufunc(..., out=)``;
+    * EXACTLY ``numpy.ndarray``, not a subclass.  A ``np.ma.MaskedArray`` used to
+      be accepted, and the kernel would then write through it and DISCARD its
+      mask -- every masked element silently becomes valid data for a
+      ``.filled()`` consumer.  ``np.matrix`` and any other subclass with its own
+      ``__setitem__`` / ``__array_wrap__`` semantics are refused for the same
+      reason: the kernel writes with basic slicing and ``ufunc(..., out=)`` and
+      cannot honour subclass invariants;
     * exactly ``dtype`` (default float32).  A float64 buffer would make the
       kernel's in-place ``-=`` / ``*=`` round in float64 and CHANGE OUTPUT BITS
       (the reference rounds three times in float32), so an "obviously
       compatible" wider dtype is refused, not upcast into;
     * exactly ``shape``.  Broadcasting is NOT accepted: it would write a
       different array than the one the caller holds;
-    * writeable.
+    * writeable;
+    * NO OVERLAP with any input.  ``no_alias`` is a sequence of
+      ``(label, object)`` pairs -- ``raw`` and the constants -- and ``out`` is
+      refused if it may share memory with any of them.  This is not theoretical:
+      ``pedestals[0]`` is a float32 ``(S, rows, cols)`` view, so when ``S`` ==
+      the segment count of ``raw`` it passes the ndarray / dtype / shape /
+      writeable checks, and the kernel would then overwrite the pedestals it is
+      still reading -- AND the memo would hand the corrupted ``poff`` back for
+      the rest of the run.  The test is ``np.may_share_memory``, which is
+      bounds-based and therefore CONSERVATIVE: it can refuse two provably
+      disjoint views that live in one allocation.  That is the fail-closed
+      direction for a silent-corruption bug; allocate ``out`` separately.
 
     Contiguity is deliberately NOT required: the hybrid kernel writes
     ``out[s][r0:r1]`` slices and its sparse fixup already handles a
@@ -751,9 +1111,12 @@ def check_out_buffer(out, shape, dtype=np.float32, name="out"):
     """
     want = np.dtype(dtype)
     shape = tuple(int(x) for x in shape)
-    if not isinstance(out, np.ndarray):
+    if type(out) is not np.ndarray:
         raise TypeError(
-            "%s= must be a numpy.ndarray of shape %s and dtype %s; got %s. "
+            "%s= must be a numpy.ndarray of shape %s and dtype %s -- exactly "
+            "that type, not a subclass, because the kernel writes into it with "
+            "basic slicing and cannot honour a subclass's invariants (a "
+            "np.ma.MaskedArray's mask would be silently dropped); got %s. "
             "(%s= is an optional output buffer: pass None -- the default -- to "
             "let pscalib allocate one.)"
             % (name, shape, want, type(out).__name__, name))
@@ -773,6 +1136,20 @@ def check_out_buffer(out, shape, dtype=np.float32, name="out"):
         raise ValueError(
             "%s= is not writeable (out.flags.writeable is False); the "
             "calibration writes its result into it." % (name,))
+    for label, other in no_alias:
+        if not isinstance(other, np.ndarray):
+            continue                      # None, a list, a scalar: cannot alias
+        if np.may_share_memory(out, other):
+            raise ValueError(
+                "%s= may share memory with %s: the calibration writes into %s "
+                "while it is still READING %s, so the result would be computed "
+                "from constants it has already overwritten -- and the derived "
+                "constants are memoised, so a corrupted plane would be handed "
+                "back for the rest of the run.  Nothing about the dtype or the "
+                "shape catches this (pedestals[0] is a float32 (S, rows, cols) "
+                "view and passes every other check when S == raw.shape[0]), so "
+                "it is checked directly.  Allocate %s= as its own array."
+                % (name, label, name, label, name))
     return out
 
 
@@ -793,42 +1170,9 @@ def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
     if dense_frac is None:
         dense_frac = DENSE_FRAC
 
-    raw = np.asarray(raw)
-    if raw.ndim != 3:
-        raise ValueError(
-            "raw must be 3-D (N,512,1024); got shape %s" % (raw.shape,))
-    pedestals = _as_f32(ped_src) if hoist else np.asarray(ped_src, np.float32)
-    pixel_gain = _as_f32(gain_src) if hoist else np.asarray(gain_src, np.float32)
-    if pedestals.shape[0] != N_GAIN_STAGES:
-        raise ValueError(
-            "pedestals leading axis must be %d gain stages; got shape %s"
-            % (N_GAIN_STAGES, pedestals.shape))
-
-    # ---- derived constants, HOISTED -------------------------------------
-    if hoist:
-        poff = memo((ped_src, off_src), "poff",
-                    lambda: derive_poff(pedestals, pixel_offset))
-        gfac = memo((gain_src,), "gfac", lambda: derive_gfac(pixel_gain))
-    else:
-        poff = derive_poff(pedestals, pixel_offset)
-        gfac = derive_gfac(pixel_gain)
-    mprep = _prep_mask(mask, hoist)
-
-    nseg = raw.shape[0]
-    # np.empty is byte-identical to np.zeros ONLY because every element is
-    # assigned: the loop runs s = 0..nseg-1 with nseg == raw.shape[0], and for
-    # each s the tile loop covers rows 0..nrows in contiguous non-overlapping
-    # tiles, each assigning its full (rows, ncol) slice.  The sparse fixups only
-    # OVERWRITE already-assigned elements.  (Proved by the gate's poison test.)
-    if out is None:
-        out = np.empty(raw.shape, dtype=np.float32)
-    else:
-        # A caller-supplied buffer is VALIDATED, never silently ignored and
-        # never silently replaced by a fresh allocation -- see
-        # :func:`check_out_buffer` for why a quiet fallback would be the worst
-        # possible failure mode here.
-        out = check_out_buffer(out, raw.shape)
-
+    # The backend is validated FIRST, before any 67 MB allocation and before any
+    # constants derivation: it is a hard error either way, and doing 200 ms of
+    # work before raising it is pure waste.
     if backend not in COMPUTE_BACKENDS and backend != "auto":
         # LOUD, never a silent fallback.  Two kinds of caller land here and both
         # must be refused rather than quietly given the numpy hybrid:
@@ -852,32 +1196,120 @@ def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
             "numpy so that a timing measurement cannot be mislabelled."
             % (backend,))
 
-    # ---- SIGNED / non-unsigned raw: route to the verbatim reference ------
-    # The reference classifies the gain code as ``(arr >> 14).astype(np.uint8)``,
-    # so a NEGATIVE word yields 255, which matches none of (0, 1, 3) and
-    # therefore falls to the ``np.select`` DEFAULT lane (pedoff 0.0, factor 0.0)
-    # and renders as 0.0.  The numpy hybrid's classifier ``a >= 0x4000`` is
-    # False for every negative word, so such a pixel never enters the residual
-    # set nor the gather fixup and silently keeps its stage-0 base value -- an
-    # error of order 3e4 ADU, not a sign-of-zero.
+    raw = np.asarray(raw)
+    if raw.ndim != 3:
+        raise ValueError(
+            "raw must be 3-D (N,512,1024); got shape %s" % (raw.shape,))
+    pedestals = _as_f32(ped_src) if hoist else np.asarray(ped_src, np.float32)
+    pixel_gain = _as_f32(gain_src) if hoist else np.asarray(gain_src, np.float32)
+    if pedestals.shape[0] != N_GAIN_STAGES:
+        raise ValueError(
+            "pedestals leading axis must be %d gain stages; got shape %s"
+            % (N_GAIN_STAGES, pedestals.shape))
+    # The GAIN's leading axis is checked here too, next to the pedestals', and
+    # not left to blow up inside the kernel.  Truncated gain constants are only
+    # INDEXED at stage 2 by the sparse gather, i.e. only on an event that happens
+    # to contain a gbits==3 or a BAD pixel, so thousands of events can be
+    # calibrated before the IndexError arrives mid-run -- while the reference,
+    # whose np.select touches gfac[2, s] unconditionally, raises on the first
+    # event.  Accepting malformed constants until the data happens to notice is
+    # the worst of the three behaviours.
+    if pixel_gain.shape[0] != N_GAIN_STAGES:
+        raise ValueError(
+            "pixel_gain leading axis must be %d gain stages; got shape %s"
+            % (N_GAIN_STAGES, pixel_gain.shape))
+    if mask is not None:
+        check_mask_shape(mask, raw.shape)
+
+    # ---- derived constants, HOISTED -------------------------------------
+    # The poff memo is SKIPPED when pixel_offset is None, which is the default
+    # and the shipped snapshot's shape: derive_poff then returns ``pedestals``
+    # ITSELF, so the derivation is free and there is nothing to amortise.  Going
+    # through the memo for it would be worse than pointless -- the derived value
+    # IS a source, so the alias guard correctly refuses to cache it, and the
+    # ``miss`` counter that :func:`memo_stats` tells callers to assert on would
+    # grow by one on EVERY event in the default configuration, making a working
+    # memo indistinguishable from a broken one.
+    if hoist and off_src is not None:
+        poff = memo((ped_src, off_src), "poff",
+                    lambda: derive_poff(pedestals, pixel_offset))
+    else:
+        poff = derive_poff(pedestals, pixel_offset)
+    gfac = memo((gain_src,), "gfac",
+                lambda: derive_gfac(pixel_gain)) if hoist \
+        else derive_gfac(pixel_gain)
+    mprep = _prep_mask(mask, hoist)
+
+    nseg = raw.shape[0]
+    # np.empty is byte-identical to np.zeros ONLY because every element is
+    # assigned: the loop runs s = 0..nseg-1 with nseg == raw.shape[0], and for
+    # each s the tile loop covers rows 0..nrows in contiguous non-overlapping
+    # tiles, each assigning its full (rows, ncol) slice.  The sparse fixups only
+    # OVERWRITE already-assigned elements.  (Proved by the gate's poison test.)
+    if out is None:
+        out = np.empty(raw.shape, dtype=np.float32)
+    else:
+        # A caller-supplied buffer is VALIDATED, never silently ignored and
+        # never silently replaced by a fresh allocation -- see
+        # :func:`check_out_buffer` for why a quiet fallback would be the worst
+        # possible failure mode here.  It must also not OVERLAP anything the
+        # calibration reads, which nothing else in the signature can catch.
+        out = check_out_buffer(
+            out, raw.shape,
+            no_alias=(("raw", raw), ("pedestals", ped_src),
+                      ("pedestals (as float32)", pedestals),
+                      ("pixel_gain", gain_src),
+                      ("pixel_gain (as float32)", pixel_gain),
+                      ("pixel_offset", off_src), ("mask", mask),
+                      ("the derived poff", poff), ("the derived gfac", gfac)))
+
+    # ---- SIGNED / NARROW raw: route to the verbatim reference -------------
+    # (a) NOT UNSIGNED.  The reference classifies the gain code as
+    # ``(arr >> 14).astype(np.uint8)``, so a NEGATIVE word yields 255, which
+    # matches none of (0, 1, 3) and therefore falls to the ``np.select`` DEFAULT
+    # lane (pedoff 0.0, factor 0.0) and renders as 0.0.  The numpy hybrid's
+    # classifier ``a >= 0x4000`` is False for every negative word, so such a
+    # pixel never enters the residual set nor the gather fixup and silently keeps
+    # its stage-0 base value -- an error of order 3e4 ADU, not a sign-of-zero.
+    # (b) NARROWER THAN 2 BYTES.  A jungfrau word is a 14-bit ADC code plus 2
+    # gain bits, so it does not fit in 8; ``arr >> 14`` is identically 0 for a
+    # uint8 and the gain lanes become unreachable.  The two paths do not even
+    # agree on whether that is an error: the reference's ``arr & 0x3fff`` is an
+    # out-of-range python int for a uint8 array, which raises OverflowError under
+    # NEP-50 casting (numpy >= 2) though not on numpy 1.26.4's value-based rules,
+    # while the hybrid's classifier is all-False and it happily returns numbers on
+    # both.  Deferring makes the two paths agree on EVERY numpy.
     # Real jungfrau raw is uint16 (the dataset, the fixture and the public
-    # docstring all say so), so this was latent and no measured number is
-    # affected -- but the pure-numpy path is the byte-exact fallback and must
+    # docstring all say so), so both of these are latent and no measured number
+    # is affected -- but the pure-numpy path is the byte-exact fallback and must
     # stay one.  Deferring to the reference closes the exactness gap by
     # construction.
-    if raw.dtype.kind != "u":
+    if raw.dtype.kind != "u" or raw.dtype.itemsize < 2:
         from .jungfrau import calib_jungfrau_reference
+        if raw.dtype.kind != "u":
+            why = ("raw.dtype=%s is not unsigned; the fast classifiers are only "
+                   "sound for unsigned raw" % (raw.dtype,))
+        else:
+            why = ("raw.dtype=%s is narrower than the 14-bit ADC code plus 2 "
+                   "gain bits a jungfrau word carries; the fast classifiers "
+                   "cannot see a gain code that cannot be represented"
+                   % (raw.dtype,))
         res = calib_jungfrau_reference(raw, ped_src, gain_src,
                                        pixel_offset=off_src, mask=mask)
         if out is not None:
             out[...] = res
             res = out
-        LAST_CALL.clear()
-        LAST_CALL.update({
+        _publish_last_call({
             "backend_used": "reference",
-            "reference_reason": "raw.dtype=%s is not unsigned; the fast "
-                                "classifiers are only sound for unsigned raw"
-                                % (raw.dtype,),
+            "reference_reason": why,
+            "A_pure_g0": 0, "B_dense_blend": 0, "C_sparse_gather": 0,
+            "n_gathered": 0,
+            "mask_folded": False,
+            "fold_reason": "backend_used=reference: the tiled kernel did not "
+                           "run, so there was no fold to take",
+            "tile_rows": None,
+            "tile_rows_requested": int(tile_rows),
+            "dense_frac": float(dense_frac),
         })
         return res
 
@@ -920,11 +1352,14 @@ def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
     info = _hybrid_numpy(raw, poff, gfx, mprep, out,
                          int(tile_rows), float(dense_frac), folded)
 
-    LAST_CALL.clear()
-    LAST_CALL.update(info)
-    LAST_CALL["backend_used"] = used
-    LAST_CALL["tile_rows"] = int(tile_rows)
-    LAST_CALL["dense_frac"] = float(dense_frac)
-    LAST_CALL["mask_folded"] = bool(folded)
-    LAST_CALL["fold_reason"] = fold_reason
+    # ``info["tile_rows"]`` is the EFFECTIVE step the kernel walked, not the
+    # request: reporting the request would label a run "tile_rows=-7" that
+    # actually ran one tile per segment.  Both are published.
+    info["backend_used"] = used
+    info["reference_reason"] = None
+    info["tile_rows_requested"] = int(tile_rows)
+    info["dense_frac"] = float(dense_frac)
+    info["mask_folded"] = bool(folded)
+    info["fold_reason"] = fold_reason
+    _publish_last_call(info)
     return out

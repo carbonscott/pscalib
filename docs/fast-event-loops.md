@@ -79,6 +79,35 @@ One deployment note: under Ray, a task declared without `num_cpus` keeps full
 CPU affinity, so the reader thread and the compute thread land on different
 cores. A task pinned to a single core gets nothing from this.
 
+### The threading contract, stated
+
+This is the one caller-side move that introduces a second thread, so here is
+what `pscalib` promises — the loop above is safe, and it is worth knowing *why*,
+because a variant of it would not be.
+
+- **The prefetch loop above is safe as written.** Its thread body is pure I/O
+  (`ridx.read_events`); `pscalib.calib()` stays on the consumer thread; every
+  scratch buffer inside the kernel is a per-call local; and the `np.errstate` the
+  kernel uses is thread-local. Nothing in the reader thread touches the
+  calibration at all.
+- **`pscalib.calib()` may be called from several threads.** The result is
+  bit-identical to the single-threaded result — the derived-constants cache is a
+  pure function of its inputs, and concurrent *cold* callers serialise inside it
+  so that one derivation is shared rather than N built in parallel (which is a
+  memory-footprint fix, not a correctness one: 0 byte-divergent threads were
+  observed over 8 threads × 5 trials).
+- **What is *not* thread-safe is the diagnostics.** `memo_stats()`'s counters are
+  incremented non-atomically (advisory only), `LAST_CALL` is global and belongs
+  to whichever call wrote it last (take a snapshot with
+  `pscalib.apply.last_call()`), and `memo_clear()` has no post-condition while
+  another thread is calling in.
+- **One `out=` buffer per concurrent caller.** See move 2 below: the buffer is
+  not copied, so two threads sharing one buffer are writing over each other.
+- The note in `pscalib.apply._fastcalib` that the kernel is "SINGLE-THREADED" is
+  about the kernel's *own* thread use — it spawns none, so a measured speedup at
+  `workers=1` is real. It is **not** a statement that the entry point may only be
+  called from one thread.
+
 ## 2. Reuse the calibration output buffer — `out=`
 
 Every `calib()` call otherwise first-touches 67 MB of fresh pages.
@@ -101,6 +130,31 @@ supports_out = "out" in inspect.signature(pscalib.calib).parameters
 what is computed. The gate for this covers all four combinations —
 allocated-vs-reference, `out`-vs-reference, `out`-vs-allocated, and
 view-vs-allocated — at `max|diff| = 0` with zero sign-of-zero disagreements.
+
+**The trap this move brings with it, and it is the mirror image of move 1.**
+`calib(..., out=buf)` **returns `buf` itself**. It does not copy. So the moment
+you combine this move with the prefetch thread above, or with any batching, the
+obvious-looking code is wrong:
+
+```python
+results = []
+for evt in batch:
+    results.append(pscalib.calib(raw, constants, out=cal_buf))   # WRONG
+# results is now [cal_buf, cal_buf, cal_buf, ...] -- N references to ONE buffer
+# holding only the LAST event. No exception, no warning.
+q.put(pscalib.calib(raw, constants, out=cal_buf))                # WRONG, same bug
+```
+
+Consume the result before the next call, or copy it, or use one buffer per
+in-flight event (a small ring of buffers is the usual answer). This is why the
+loop in move 3 accumulates *inside* the iteration and keeps nothing.
+
+Two smaller rules from the same place: the buffer must not share memory with
+`raw` or with any constants array (it is refused if it may — `pedestals[0]`
+otherwise passes every dtype and shape check, and the calibration would overwrite
+the pedestals it is still reading), and it must be exactly a `numpy.ndarray`, not
+a subclass; a `np.ma.MaskedArray` is refused rather than written through with its
+mask silently dropped.
 
 ## 3. An all-finite fast path, taken on measured evidence
 
@@ -163,6 +217,26 @@ def _stack_into(evt, det_name, buf):
 **Why it cannot move a bit:** same segment order, same dtype, same copies — only
 the 33.5 MB allocation is reused. The reader package is not modified.
 
+## The constants cache, and what a long loop owes it
+
+The other half of the per-event win is that the derived constant planes (`poff =
+pedestals + pixel_offset`, `gfac = 1/pixel_gain`, and the folded `gfac × mask`)
+are cached across calls rather than rebuilt every event. Two facts a long-running
+loop needs:
+
+- It is keyed on **array identity**, so a provider that hands back a fresh
+  constants array per event gets no amortisation at all, and an in-place mutation
+  of a constants array is invisible to it (it will keep serving the
+  pre-mutation planes). Hold one constants set for the run; pass `pixel_offset`
+  as an array or `None`, never `0.0`.
+- It is **unbounded** — 403 MB per jungfrau constants set with
+  `pixel_offset=None`, 604 MB with an offset, up to 1074 MB if the constants
+  arrive as float64, times the number of live constants sets. `pscalib.memo_nbytes()`
+  reports it, `pscalib.memo_clear()` drops it. Neither ever changes an output bit.
+
+The README's "derived-constants cache — four rules" section is the full
+statement.
+
 ## Two things that were tried and did not work
 
 **A batched float64 accumulate — rejected, 0.95×.** Buffer K calibrated events
@@ -190,7 +264,9 @@ the per-event pass goes away. Specified but not built.
 
 1. Prefetch thread, queue depth 1, many batches. Print your overlap fraction and
    compare it against `(n−1)/n`.
-2. `pscalib.calib(..., out=buf)`, with `out=` support detected not assumed.
+2. `pscalib.calib(..., out=buf)`, with `out=` support detected not assumed — and
+   the result consumed (or copied) before the next call, because it *is* your
+   buffer. One buffer per in-flight event, one per concurrent caller.
 3. All-finite fast path gated on `np.count_nonzero`, with the original
    expression kept verbatim as the fallback. Never `where=` on the accumulate.
 4. `nvalid` deferred to the end.
@@ -198,3 +274,6 @@ the per-event pass goes away. Specified but not built.
 6. Verify the whole thing is inert: compare your output against the unpatched
    loop as **raw bit patterns**, not with a tolerance, over the same events —
    including at least one run that forces the non-finite lane.
+7. One constants set held for the whole run, `pixel_offset` an array or `None`
+   (never `0.0`), no in-place edits to a constants array, and
+   `pscalib.memo_nbytes()` printed once if you care about RSS.
