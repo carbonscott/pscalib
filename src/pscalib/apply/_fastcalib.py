@@ -30,40 +30,59 @@ This module holds TWO things, neither of which changes a single output bit:
    an option: ``ndarray.__hash__`` is ``None``.)
 
 2. **The pure-numpy hybrid kernel.**  Per spatial tile, one of three strategies
-   is chosen from cheap integer reductions OF THAT TILE.  The classifier is ONE
-   bitwise-OR reduction; ``hi = OR(tile) & ~0x3fff``:
+   is chosen from ONE cheap pass over that tile.  The classifier is the boolean
+   ``sel = (tile >= 0x4000)`` and its ``count_nonzero``; the SAME buffer is then
+   reused as the residual selector and as the dense/sparse decision, so nothing
+   is scanned twice:
 
-     A. ``hi == 0`` -- no pixel has any bit above bit 13, so every gain code is 0
-        AND ``raw & 0x3fff == raw``: the whole tile is stage 0 and the ``& MSK``
-        can be DROPPED.  One constant plane, one streaming pass.
+     A. ``count == 0`` -- no pixel has any bit above bit 13, so every gain code
+        is 0 AND ``raw & 0x3fff == raw``: the whole tile is stage 0 and the
+        ``& MSK`` can be DROPPED.  One constant plane, one streaming pass.
      B. many non-G0 pixels -- a DENSE two-plane blend: compute the stage-0 AND
         the stage-1 result for EVERY pixel and ``np.copyto(..., where=)`` between
         the finished values.  Selection selects, it does not compute, so this is
         bit-exact; and nothing in it is proportional to how many pixels switched,
         which is what caps the fixup slope on high-non-G0 frames.
      C. few non-G0 pixels -- the stage-0 pass, then a SPARSE gather fixup that
-        overwrites just those pixels.
+        overwrites just those pixels.  Here the ``& MSK`` is DROPPED TOO: for
+        UNSIGNED raw every word carrying a bit above bit 13 satisfies
+        ``a >= 0x4000``, is therefore in the residual set, and is overwritten
+        WHOLESALE by the gather; every other word satisfies ``a & MSK == a``.
 
    B-vs-C is decided per tile by the tile's own non-G0 count against
    :data:`DENSE_FRAC` (measured, not guessed).  Either way stage 2 (``gbits==3``)
    and the BAD code (``gbits==2``) -- together well under 0.002% of pixels -- are
-   gathered.  Note ``a.max()`` would NOT be a sound classifier where OR is: a
-   negative word of a signed raw dtype has a small max yet a nonzero truncated
-   gain code, and a word with bit 22 set truncates to code 0 yet is not equal to
-   ``raw & MSK``.
+   gathered.
+
+   Every one of those classifiers is sound ONLY FOR UNSIGNED raw, which is why
+   ``raw.dtype.kind != "u"`` is routed to the verbatim reference one function
+   below (:func:`calib_jungfrau_fast`) and never reaches this kernel.  For a
+   SIGNED dtype a negative word has a small ``max`` and compares False against
+   ``0x4000``, yet its truncated gain code is 255 -- the reference's BAD lane --
+   so it would silently keep a stage-0 value.  Given unsigned raw,
+   ``count_nonzero(a >= 0x4000) == 0`` is EXACTLY the older
+   ``bitwise_or.reduce(a) & ~MSK == 0`` (both say "no bit above bit 13 is set
+   anywhere in this tile"), and, in the dense branch, ``a.max() < 0x8000`` is
+   EXACTLY the older ``hi == 0x4000`` (both say "no bit above bit 14 is set
+   anywhere in this tile", i.e. only stages 0 and 1 are present).
 
    Both branches evaluate, for every pixel, LITERALLY the reference expression
    ``((raw & MSK).astype(f32) - poff[stage]) * gfac[stage] * mask.astype(f32)``
    with the reference's operation order and its THREE separate float32
-   roundings.  The path choice depends only on the frame's own contents, so it is
-   invariant under any event partition; blocking is over SPATIAL axes only.
+   roundings -- EXCEPT that, when :func:`fold_is_exact` says it is a theorem,
+   the last two multiplies are pre-composed into ``gfm = gfac * mask`` once per
+   (gain, mask) pair and the per-tile ``t *= mask`` disappears (see
+   :func:`fold_is_exact` for the proof and the fail-closed guard).  The path
+   choice depends only on the frame's own contents, so it is invariant under any
+   event partition; blocking is over SPATIAL axes only.
 
 Traps that are deliberately respected here (each one has already bitten):
 
   * ``-0.0`` IS LOAD-BEARING.  A masked pixel whose ``(adc - poff) * gfac`` is
     finite-negative becomes ``x * 0.0 == -0.0``.  Writing a literal ``0.0`` for
     masked pixels is BIT-WRONG.  Nothing here ever short-circuits the mask
-    multiply.
+    multiply -- and the ``gfm`` fold, which LOOKS like a short-circuit, is
+    guarded by :func:`fold_is_exact` precisely so that it reproduces that sign.
   * NO DOUBLE ROUNDING.  The reference rounds THREE times (subtract, multiply,
     mask-multiply).  Computing the chain in float64 and storing once gives ONE
     rounding and differs on millions of pixels per frame.  Every intermediate
@@ -95,7 +114,7 @@ import numpy as np
 __all__ = [
     "MSK", "BSH", "N_GAIN_STAGES",
     "memo", "memo_clear", "memo_stats", "memo_size",
-    "derive_poff", "derive_gfac",
+    "derive_poff", "derive_gfac", "derive_gfm", "fold_is_exact",
     "calib_jungfrau_fast", "backend_info",
 ]
 
@@ -121,11 +140,22 @@ def _env_float(name, default):
         return default
 
 
-#: Rows per spatial tile for the numpy path.  128 rows x 1024 cols x 4 B = 512 KB
-#: of float32, so a tile plus its scratch stays resident in L2/L3 while the
-#: in-place ops run over it.  MEASURED best of {0(whole),512,256,128,64,32} on the
-#: campaign fixture at every non-G0 fraction from 0 to 1 (job 34302162).
-TILE_ROWS = _env_int("PSCALIB_CALIB_TILE_ROWS", 128)
+#: Rows per spatial tile for the numpy path.  A tile plus its scratch wants to
+#: stay resident in cache while the in-place ops stream over it.
+#:
+#: 128 was the measured optimum for the PREVIOUS kernel (job 34302162).  The
+#: current kernel does strictly fewer passes per tile -- the classifier, the
+#: dense/sparse count and the residual selector are ONE pass, the dense scratch
+#: is raw-dtype rather than float32, and the mask multiply is folded away -- so
+#: the per-tile working set shrank and the per-tile python overhead became the
+#: thing worth amortising.  RE-MEASURED end to end over the 8 real fixture
+#: frames (job 34316936 on sdfmilan253, dense_frac=0.60, mean ms/frame):
+#:   tile_rows   32     64     128    256    512
+#:   ms/frame    44.96  39.09  37.72  35.08  34.25   <- 512 wins
+#: so the default moves 128 -> 512.  (512 == the full segment height, i.e. one
+#: tile per segment, for the 512x1024 jungfrau panel.)  Byte-exactness is
+#: tile-INDEPENDENT and the gate proves it at 32, 128 and 512.
+TILE_ROWS = _env_int("PSCALIB_CALIB_TILE_ROWS", 512)
 
 #: Per-tile non-G0 FRACTION above which the dense two-plane blend beats the
 #: sparse gather.  MEASURED, not guessed: forcing dense-on-every-tile against
@@ -146,6 +176,11 @@ TILE_ROWS = _env_int("PSCALIB_CALIB_TILE_ROWS", 128)
 #: Byte-exactness is threshold-INDEPENDENT: the gate forces dense-on-every-tile
 #: (0.0) and gather-on-every-tile (1e9) and both are byte-exact on all 8 real
 #: frames, so any per-tile mixture of the two is byte-exact too.
+#: RE-MEASURED for the current kernel (job 34316936, sdfmilan253, tile_rows=128,
+#: mean ms/frame over the 8 real fixture frames):
+#:   dense_frac  0.02   0.10   0.20   0.35   0.60   1e9
+#:   ms/frame    41.05  44.52  38.50  36.85  35.71  42.09    <- 0.60 still wins
+#: so 0.60 is kept.
 DENSE_FRAC = _env_float("PSCALIB_CALIB_DENSE_FRAC", 0.60)
 
 #: ``auto`` (== ``numpy``: the numpy hybrid is the ONLY compute backend) |
@@ -353,7 +388,118 @@ def backend_info():
 # ==========================================================================
 # 4. The pure-numpy hybrid kernel
 # ==========================================================================
-def _gather_fixup(a, resid, poff, gfac, mt, t, s, r0, r1):
+#: The ``dtype=`` of the fused ``np.subtract(a, p, out=t, dtype=np.float32)``
+#: that replaced ``t[...] = a ; t -= p`` in every base pass.  It is
+#: BELT-AND-BRACES: a float32 ``out=`` already pins the loop, and the fused form
+#: was MEASURED bit-identical to the two-step form on numpy 1.26.4 for uint16,
+#: uint32 AND uint64 raw with or without the keyword.  It is written anyway
+#: because it makes the single-precision requirement explicit at the call site
+#: -- the worry it answers is that for a raw dtype that does not cast SAFELY to
+#: float32 numpy might pick the ``dd->d`` loop, subtract in float64 and narrow
+#: into ``out``, i.e. DOUBLE-ROUND.  It does not, and this keyword stops a
+#: future numpy from re-opening the question silently.  It costs nothing.
+_SUB_DTYPE = np.float32
+
+#: Magnitude ceiling for :func:`fold_is_exact`.  See its docstring for why
+#: 1e15 leaves ~8 orders of magnitude of headroom under float32's 3.403e38.
+FOLD_LIM = 1e15
+
+
+def fold_is_exact(poff, gfac, mprep, raw_dtype, lim=FOLD_LIM):
+    """May ``gfm = gfac * mask`` replace the two multiplies ``(x*gfac)*mask``?
+
+    Returns ``(ok, reason)``.  FAIL-CLOSED: every conjunct must hold, and any
+    one that does not returns ``False`` with the reason, never an exception --
+    the caller then runs the UNFOLDED path (which keeps the per-tile
+    ``t *= mask``) and is byte-exact by the older argument.
+
+    ``(x*g)*m == x*(g*m)`` is NOT an identity; float multiplication is not
+    associative.  It IS exact under these conditions:
+
+      1. ``raw`` is UNSIGNED.  The whole kernel's classifiers need this anyway
+         (see the module docstring), and the ADC bound in (4) uses it.
+      2. ``m`` is EXACTLY 0 or 1, and its zeros are ``+0.0`` (never ``-0.0``).
+         Then ``g*m`` is either ``g`` (exact) or ``+-0.0`` carrying ``g``'s
+         sign, and ``x*(+-0.0)`` has the sign ``sign(x) XOR sign(g)`` -- which
+         is exactly ``sign(x*g)``, so the reference's ``-0.0`` for a
+         finite-negative masked pixel is reproduced.
+         ``-0.0`` is EXCLUDED even though it satisfies the stage-0/1/2 lanes,
+         because it BREAKS THE BAD LANE: the reference gives ``gbits == 2`` the
+         ``np.select`` default and computes ``(adc - 0.0) * 0.0``, which for
+         ``adc >= 0`` is ``+0.0``, and then multiplies by the mask -- giving
+         ``-0.0`` for a ``-0.0`` mask.  The folded gather does NOT multiply the
+         bad lane by the mask (it has no gain plane to fold into), so it would
+         leave ``+0.0``.  With the mask's zeros pinned to ``+0.0`` the two
+         agree, and dropping the bad lane's mask multiply becomes a theorem:
+         ``+0.0 * 1 == +0.0 * 0 == +0.0``.
+      3. ``x`` and ``g`` are finite (so ``poff`` and ``gfac`` are finite, since
+         ``x = adc - poff``), and ``float32 x mask.dtype`` stays float32, so the
+         fold introduces no wider intermediate and no extra rounding.
+      4. ``x*g`` does not overflow to ``+-inf``.  ``inf*0`` is NaN while
+         ``x*(+-0.0)`` is ``+-0.0``, so an overflow would BREAK the fold.  With
+         ``|poff| < lim``, ``|gfac| < lim`` and unsigned raw, every pixel whose
+         value SURVIVES has ``adc <= 0x3fff == 16383`` -- the base pass's
+         dropped ``& MSK`` can leave a larger intermediate, but only for pixels
+         that are in the residual set and are then overwritten wholesale by the
+         gather, which does apply ``& MSK``.  So ``|x*g| <= (16383 + lim)*lim``;
+         at ``lim = 1e15`` that is ~1e30, comfortably below 3.403e38.
+
+    Measured on the real fixture the margins are enormous (max|poff| ~ 1e4,
+    max|gfac| ~ 1e1), but the guard is what makes the fold a theorem rather
+    than a hope.
+    """
+    if np.dtype(raw_dtype).kind != "u":
+        return False, "raw dtype %s is not unsigned" % np.dtype(raw_dtype)
+    if not (np.isfinite(poff).all() and np.isfinite(gfac).all()):
+        return False, "poff or gfac is not everywhere finite"
+    mp = float(np.abs(poff).max())
+    mg = float(np.abs(gfac).max())
+    if not (mp < lim and mg < lim):
+        return False, ("max|poff|=%.3e max|gfac|=%.3e is not below lim=%.3e"
+                       % (mp, mg, lim))
+    worst = (np.float32(16383.0) + np.float32(lim)) * np.float32(lim)
+    if not np.isfinite(worst):
+        return False, "worst-case product (16383+lim)*lim overflows float32"
+    if mprep is not None:
+        m = np.asarray(mprep)
+        if m.shape != tuple(gfac.shape[1:]):
+            return False, ("mask shape %s != per-stage gain plane shape %s"
+                           % (m.shape, tuple(gfac.shape[1:])))
+        if np.result_type(np.float32, m.dtype) != np.dtype(np.float32):
+            return False, ("float32 x mask(%s) promotes to %s, not float32"
+                           % (m.dtype, np.result_type(np.float32, m.dtype)))
+        if m.dtype.kind == "f":
+            if not np.isfinite(m).all():
+                return False, "mask is not everywhere finite"
+            if np.signbit(m).any():
+                return False, ("mask carries a negative zero; -0.0 breaks the "
+                               "BAD-code lane of the fold (see this "
+                               "function's docstring, conjunct 2)")
+        if not (m.min() >= 0 and m.max() <= 1):
+            return False, ("mask is not within [0,1] (min=%r max=%r)"
+                           % (m.min(), m.max()))
+        if not np.array_equal(m, m.astype(np.bool_)):
+            return False, "mask has values other than exactly 0 or 1"
+    return True, ("ok: max|poff|=%.4g max|gfac|=%.4g mask in {+0.0, 1}; worst "
+                  "|x*g| <= %.3e < %.3e"
+                  % (mp, mg, float(worst), float(np.finfo(np.float32).max)))
+
+
+def derive_gfm(gfac, mprep):
+    """``gfac * mask`` broadcast over the 3 gain stages, as float32.
+
+    ONLY call this when :func:`fold_is_exact` said yes -- it is that predicate
+    that makes ``x * gfm`` equal the reference's ``(x * gfac) * mask`` bit for
+    bit.  The guard's ``np.result_type`` conjunct is what makes the multiply
+    below a float32 loop (a uint8 / bool / float16 mask converts to float32
+    EXACTLY for every representable value, so this equals the reference's
+    ``gfac * mask.astype(np.float32)``); the ``.astype(..., copy=False)`` is a
+    no-op assertion of that, not a cast.
+    """
+    return (gfac * np.asarray(mprep)[None, ...]).astype(np.float32, copy=False)
+
+
+def _gather_fixup(a, resid, poff, gfx, mt, t, s, r0, r1, folded=False):
     """Overwrite the pixels selected by ``resid`` with their exact per-stage value.
 
     ``resid`` is a SUPERSET-safe selection: EVERY selected pixel -- including one
@@ -364,6 +510,13 @@ def _gather_fixup(a, resid, poff, gfac, mt, t, s, r0, r1):
     dense two-plane blend gives the STAGE-1 value to every pixel with a high bit
     set, and a word with e.g. bit 22 set has a high bit yet a code that truncates
     to 0, so "leave code 0 alone" would silently keep the stage-1 value.)
+
+    ``folded`` says ``gfx`` is ``gfm = gfac * mask`` and already carries the
+    mask, so the separate mask multiply is dropped -- for stages 0/1/2 because
+    :func:`fold_is_exact` proved it, and for the BAD lane because that lane
+    computes ``(adc - 0.0) * 0.0`` with ``adc >= 0``, i.e. ``+0.0``, and
+    ``+0.0 * 1 == +0.0 * 0 == +0.0`` (the guard forbids a ``-0.0`` mask, which
+    is the only value that would make the dropped multiply observable).
     """
     idx = np.flatnonzero(np.asarray(resid).ravel())
     if idx.size == 0:
@@ -373,12 +526,18 @@ def _gather_fixup(a, resid, poff, gfac, mt, t, s, r0, r1):
     # bits, so e.g. a code of 256 collapses to 0 (= stage 0).  We must truncate
     # identically or we would "fix up" a pixel the reference treats as G0.
     codes = (af[idx] >> BSH).astype(np.uint8)
+    # ``t.reshape(-1)`` on a NON-contiguous view returns a silent COPY, not a
+    # view, so every scatter below would land in a temporary and be discarded --
+    # with no exception and no warning, and a gate whose own output array is
+    # always contiguous could never catch it.  ``out=`` is a PUBLIC parameter
+    # now, so a caller really can hand in a strided view; this guard, and the
+    # ``np.unravel_index`` fallback it selects, are what make that correct.
     flat_out = t.flags["C_CONTIGUOUS"]
     tf = t.reshape(-1) if flat_out else None
     rr = cc = None
     if not flat_out:
         rr, cc = np.unravel_index(idx, t.shape)
-    mf = None if mt is None else np.asarray(mt).ravel()
+    mf = None if (mt is None or folded) else np.asarray(mt).ravel()
     m0 = codes == 0
     m1 = codes == 1
     m3 = codes == 3
@@ -399,7 +558,7 @@ def _gather_fixup(a, resid, poff, gfac, mt, t, s, r0, r1):
             v *= np.float32(0.0)
         else:
             v -= poff[st, s, r0:r1].ravel()[ii]
-            v *= gfac[st, s, r0:r1].ravel()[ii]
+            v *= gfx[st, s, r0:r1].ravel()[ii]
         if mf is not None:
             v *= mf[ii]
         if flat_out:
@@ -409,20 +568,35 @@ def _gather_fixup(a, resid, poff, gfac, mt, t, s, r0, r1):
     return int(idx.size)
 
 
-def _hybrid_numpy(raw, poff, gfac, mprep, out, step, dense_frac):
-    """The pure-numpy hybrid.  Returns the per-case tile census."""
+def _hybrid_numpy(raw, poff, gfx, mprep, out, step, dense_frac, folded=False):
+    """The pure-numpy hybrid.  Returns the per-case tile census.
+
+    ``raw`` MUST be unsigned -- every classifier below is only sound for an
+    unsigned dtype and :func:`calib_jungfrau_fast` routes anything else to the
+    verbatim reference before reaching here.
+
+    ``gfx`` is ``gfac`` when ``folded`` is False and ``gfm = gfac * mask`` when
+    it is True; ``folded`` is set ONLY when :func:`fold_is_exact` said so, and
+    it is exactly the flag that removes the per-tile ``t *= mask``.
+    """
     nseg, nrows, ncols = raw.shape
     if not step or step <= 0 or step > nrows:
         step = nrows
     p0a, p1a = poff[0], poff[1]
-    g0a, g1a = gfac[0], gfac[1]
+    g0a, g1a = gfx[0], gfx[1]
     # Scratch, allocated ONCE and reused by every tile so it stays hot in cache
-    # instead of being malloc'd and streamed per tile.
-    adcb = np.empty((step, ncols), dtype=np.float32)
+    # instead of being malloc'd and streamed per tile.  ``adcb`` is in the RAW
+    # dtype, not float32: it holds ``a & MSK``, it is half the bytes for uint16
+    # raw, and it feeds BOTH dense lanes through a fused subtract -- so the
+    # float32 adc copy the previous kernel materialised disappears.  ``selb`` is
+    # the classifier's output buffer AND the residual selector AND the
+    # ``np.copyto`` mask: one pass over the tile, three uses.
+    adcb = np.empty((step, ncols), dtype=raw.dtype)
     x1b = np.empty((step, ncols), dtype=np.float32)
+    selb = np.empty((step, ncols), dtype=np.bool_)
     thr = dense_frac * step * ncols
     census = {"A_pure_g0": 0, "B_dense_blend": 0, "C_sparse_gather": 0,
-              "n_gathered": 0}
+              "n_gathered": 0, "mask_folded": bool(folded)}
     # The throwaway (non-G0) lanes of the stage-0 base pass evaluate things like
     # v - NaN and can overflow float32; numpy's default is to WARN.  Suppressing
     # the warning changes no value.
@@ -438,37 +612,34 @@ def _hybrid_numpy(raw, poff, gfac, mprep, out, step, dense_frac):
                 r1 = r0 + step
                 if r1 > nrows:
                     r1 = nrows
+                h = r1 - r0
                 a = arr[r0:r1]
                 t = osg[r0:r1]
                 mt = None if ms is None else ms[r0:r1]
+                p0t, g0t = p0s[r0:r1], g0s[r0:r1]
 
-                # ONE bitwise-OR reduction classifies the tile.  OR commutes
-                # with the shift and can only SET bits, so ``hi`` is an exact
-                # statement about EVERY pixel in the tile:
-                #   hi == 0      -> no bit above bit 13 is ever set: every gain
-                #                   code is 0 AND ``raw & MSK == raw``.
-                #   hi == 0x4000 -> the only high bit ever set is bit 14: every
-                #                   gain code is 0 or 1.
-                # (``a.max()`` would NOT do: a negative word of a signed raw
-                # dtype has a max below 0x4000 yet a nonzero truncated gain
-                # code, and a word with bit 22 set truncates to code 0 yet is
-                # NOT equal to ``raw & MSK``.)
-                hi = int(np.bitwise_or.reduce(a, axis=None)) & ~MSK
-                if hi == 0:
+                # ONE pass over the tile does all THREE jobs: it classifies the
+                # tile, it counts for the dense/sparse decision, and it IS the
+                # residual selector the gather needs.  For UNSIGNED raw
+                # ``count_nonzero(a >= 0x4000) == 0`` is exactly the older
+                # ``bitwise_or.reduce(a) & ~MSK == 0``: both say "no bit above
+                # bit 13 is set anywhere in this tile", i.e. every gain code is
+                # 0 AND ``raw & MSK == raw``.  So the separate reduction over
+                # the raw tile disappears.
+                sel1 = selb[:h]
+                np.greater_equal(a, 0x4000, out=sel1)
+                n1 = int(np.count_nonzero(sel1))
+                if n1 == 0:
                     # ---- case A: no gain code anywhere in this tile ---------
                     # For a stage-0 pixel raw IS the adc code, so `& MSK` is a
                     # no-op and is dropped.  One constant plane, one pass.
                     census["A_pure_g0"] += 1
-                    t[...] = a
-                    t -= p0s[r0:r1]
-                    t *= g0s[r0:r1]
-                    if mt is not None:
+                    np.subtract(a, p0t, out=t, dtype=_SUB_DTYPE)
+                    t *= g0t
+                    if mt is not None and not folded:
                         t *= mt
                     continue
 
-                sel1 = a >= 0x4000
-                n1 = int(np.count_nonzero(sel1))
-                h = r1 - r0
                 if n1 > thr:
                     # ---- case B: DENSE two-plane blend ---------------------
                     # Compute the stage-0 AND stage-1 results for EVERY pixel and
@@ -479,17 +650,20 @@ def _hybrid_numpy(raw, poff, gfac, mprep, out, step, dense_frac):
                     # this is what caps the fixup slope.
                     census["B_dense_blend"] += 1
                     adc, x1 = adcb[:h], x1b[:h]
-                    adc[...] = a & MSK
-                    x1[...] = adc
-                    x1 -= p1s[r0:r1]
+                    np.bitwise_and(a, MSK, out=adc)
+                    np.subtract(adc, p1s[r0:r1], out=x1, dtype=_SUB_DTYPE)
                     x1 *= g1s[r0:r1]
-                    t[...] = adc
-                    t -= p0s[r0:r1]
-                    t *= g0s[r0:r1]
+                    np.subtract(adc, p0t, out=t, dtype=_SUB_DTYPE)
+                    t *= g0t
                     np.copyto(t, x1, where=sel1)
-                    if mt is not None:
+                    if mt is not None and not folded:
                         t *= mt
-                    if hi == 0x4000:
+                    # For UNSIGNED raw ``a.max() < 0x8000`` is exactly the older
+                    # ``hi == 0x4000``: no bit above bit 14 is set anywhere, so
+                    # every gain code is 0 or 1 and the blend is already the
+                    # whole answer.  The reduction is evaluated ONLY here, i.e.
+                    # on the few dense tiles, never on the common ones.
+                    if int(a.max()) < 0x8000:
                         continue        # only stages 0/1 present: done exactly
                     # The blend handed the stage-1 value to EVERY pixel with a
                     # high bit set, so the residual is every such pixel that is
@@ -499,22 +673,31 @@ def _hybrid_numpy(raw, poff, gfac, mprep, out, step, dense_frac):
                     resid = sel1 & (np.right_shift(a, BSH) != 1)
                 else:
                     # ---- case C: stage-0 pass + SPARSE gather --------------
+                    # The ``& MSK`` is DROPPED here too.  For UNSIGNED raw every
+                    # word with a bit above bit 13 satisfies ``a >= 0x4000``, is
+                    # therefore in ``resid``, and is overwritten WHOLESALE by
+                    # the gather (which does apply ``& MSK``), so whatever this
+                    # base pass computed for it -- however large, even an
+                    # overflow -- is discarded; and every word that is NOT in
+                    # ``resid`` satisfies ``a & MSK == a``.
                     census["C_sparse_gather"] += 1
-                    t[...] = a & MSK
-                    t -= p0s[r0:r1]
-                    t *= g0s[r0:r1]
-                    if mt is not None:
+                    np.subtract(a, p0t, out=t, dtype=_SUB_DTYPE)
+                    t *= g0t
+                    if mt is not None and not folded:
                         t *= mt
                     resid = sel1
                 census["n_gathered"] += _gather_fixup(
-                    a, resid, poff, gfac, mt, t, s, r0, r1)
+                    a, resid, poff, gfx, mt, t, s, r0, r1, folded)
     return census
 
 
 # ==========================================================================
 # 5. The entry point
 # ==========================================================================
-#: Diagnostics from the LAST call (tile census / which backend actually ran).
+#: Diagnostics from the LAST call: the per-case tile census, which backend
+#: actually ran, the tile/threshold knobs in force, and -- ``mask_folded`` /
+#: ``fold_reason`` -- whether the ``gfm = gfac * mask`` fold was taken and, when
+#: it was not, the exact conjunct of :func:`fold_is_exact` that declined it.
 LAST_CALL = {}
 
 
@@ -682,14 +865,50 @@ def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
         })
         return res
 
+    # ---- the MASK FOLD, memoised and fail-closed --------------------------
+    # ``gfm = gfac * mask`` pre-composes the reference's last TWO multiplies
+    # into one plane, which removes a whole streaming multiply from every tile
+    # of every event.  It is only taken when :func:`fold_is_exact` proves it is
+    # bit-neutral, and a No there is NOT an error -- it selects the unfolded
+    # lane, which still carries the per-tile ``t *= mask``.
+    #
+    # BOTH the predicate and the derived plane are keyed on the IDENTITY of
+    # EVERY source they are a function of.  ``gfm`` is a function of
+    # (pixel_gain, mask), so it is keyed on BOTH: keyed on the gain alone, a
+    # caller who changed ONLY the mask would silently receive the previous
+    # mask's fold and the mask would simply be wrong, with no error anywhere.
+    # The predicate additionally reads poff (finiteness / magnitude) and the raw
+    # dtype, so its key carries pedestals, pixel_offset and the dtype too.
+    # (The memo is the eviction-safe weakref one of section 1; an in-place
+    # mutation of a source, which does not change its id, is outside its
+    # contract -- as it already is for poff, gfac and the status mask.)
+    gfx, folded = gfac, False
+    if mprep is None:
+        fold_reason = "no mask: there is nothing to fold"
+    elif not hoist:
+        # hoist=False is the un-memoised diagnostic path: folding there would
+        # pay a full-size multiply plus two full-array scans on EVERY call.
+        fold_reason = "hoist=False: the fold is not worth deriving un-memoised"
+    else:
+        fold_ok, fold_reason = memo(
+            (ped_src, off_src, gain_src, mask), ("fold_is_exact",
+                                                 raw.dtype.str, FOLD_LIM),
+            lambda: fold_is_exact(poff, gfac, mprep, raw.dtype))
+        if fold_ok:
+            gfx = memo((gain_src, mask), "gfm",
+                       lambda: derive_gfm(gfac, mprep))
+            folded = True
+
     # 'auto' and 'numpy' are the same thing; the numpy hybrid is the only kernel.
     used = "numpy"
-    info = _hybrid_numpy(raw, poff, gfac, mprep, out,
-                         int(tile_rows), float(dense_frac))
+    info = _hybrid_numpy(raw, poff, gfx, mprep, out,
+                         int(tile_rows), float(dense_frac), folded)
 
     LAST_CALL.clear()
     LAST_CALL.update(info)
     LAST_CALL["backend_used"] = used
     LAST_CALL["tile_rows"] = int(tile_rows)
     LAST_CALL["dense_frac"] = float(dense_frac)
+    LAST_CALL["mask_folded"] = bool(folded)
+    LAST_CALL["fold_reason"] = fold_reason
     return out

@@ -189,8 +189,17 @@ def calib_jungfrau(raw, pedestals, pixel_gain, pixel_offset=None, mask=None,
     * the reference materialised, per segment per event, a ``gbits`` array and
       TWO ``np.select`` outputs the size of the segment.  The fast path instead
       blocks the segment into spatial tiles and picks, per tile, the cheapest
-      exact strategy from a cheap ``uint16`` reduction of that tile (pure stage 0
-      / dense two-plane blend / stage-0 pass plus a sparse gather).
+      exact strategy (pure stage 0 / dense two-plane blend / stage-0 pass plus a
+      sparse gather) from ONE cheap boolean pass over that tile -- the same pass
+      whose ``count_nonzero`` makes the choice also IS the residual selector the
+      gather consumes.
+    * the mask multiply is pre-composed into the gain planes once per
+      (``pixel_gain``, ``mask``) pair -- ``gfm = gfac * mask`` -- so the
+      reference's third per-pixel multiply disappears from the per-event work.
+      That fold is NOT an identity for floats, so it is taken only when
+      ``pscalib.apply._fastcalib.fold_is_exact`` proves it (unsigned raw, finite
+      and bounded ``poff``/``gfac``, and a mask that is exactly ``+0.0`` or
+      ``1``); otherwise the unfolded path runs and still multiplies by the mask.
     * that tiled hybrid is the ONLY compute backend.  There is no JIT and no
       compiled kernel: ``import pscalib`` needs numpy and the python stdlib and
       nothing else.  ``PSCALIB_CALIB_BACKEND`` accepts ``auto`` / ``numpy`` /
