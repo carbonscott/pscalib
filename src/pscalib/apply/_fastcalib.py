@@ -132,10 +132,18 @@ TILE_ROWS = _env_int("PSCALIB_CALIB_TILE_ROWS", 128)
 #:   dense  30.6   35.4   40.8   51.4   58.6   61.9   67.4   74.9   38.1
 #:   gather 26.4   33.3   36.8   45.3   56.9   71.0   93.0  119.5  175.3
 #: The gather is cheaper below the crossover and its cost grows without bound
-#: above it; the dense blend is flat-ish.  Note this was measured as a
-#: WHOLE-FRAME fraction while the threshold is applied PER TILE, so it is an
-#: estimate of the per-tile crossover, not a proof of it.
-DENSE_FRAC = _env_float("PSCALIB_CALIB_DENSE_FRAC", 0.25)
+#: above it; the dense blend is flat-ish.  But that sweep varied the WHOLE-FRAME
+#: fraction while the threshold is applied PER TILE, and gain switching is
+#: CLUSTERED, so a frame at 20% carries tiles well above 20% -- so the threshold
+#: was then tuned directly, end to end, over {0.02, 0.15, 0.35, 0.60} (job
+#: 34302301, mean ms/event over the 8 real frames at tile_rows=128):
+#:   dense_frac 0.02   0.15   0.35   0.60
+#:   mean ms    60.72  56.88  52.50  50.92     <- 0.60 wins
+#: and the same ordering holds at every synthetic fraction, so 0.60 is adopted.
+#: Byte-exactness is threshold-INDEPENDENT: the gate forces dense-on-every-tile
+#: (0.0) and gather-on-every-tile (1e9) and both are byte-exact on all 8 real
+#: frames, so any per-tile mixture of the two is byte-exact too.
+DENSE_FRAC = _env_float("PSCALIB_CALIB_DENSE_FRAC", 0.60)
 
 #: ``auto`` (numba if importable, else numpy) | ``numpy`` | ``numba`` |
 #: ``reference`` (the verbatim c5ce538 expression -- for cross-checking).
