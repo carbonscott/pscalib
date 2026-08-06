@@ -7,25 +7,37 @@
     ".goal/pscalib-pr-merge-cycle.claims.json   the claims file",
     ".goal/pscalib-pr-merge-cycle.SETUP.json    this file"
   ],
-  "relation_to_earlier_campaigns": "Written for pscalib-pr-merge-cycle, but every remote fact here applies equally to pscalib-calib-speedup and pscalib-numpy-only-8x, which carry their own SETUP.md files. Those two are the historical record of what each campaign assumed at the time and must not be edited. Where they disagree with this file about a LIVE remote fact, this file is newer — its remote, tools, paths and repo blocks were re-verified first-hand on 2026-08-06.",
-  "how_to_reference": "The contract cites keys as SETUP.<key>, where SETUP means this file — e.g. SETUP.paths.candidate_worktree_numpy. Resolve a path as paths.project_root + '/' + the relative value under paths._relative_to_project_root. Retargeting the whole set to a different user, project or site requires editing exactly ONE value: paths.project_root.",
+  "relation_to_earlier_campaigns": "Written for pscalib-pr-merge-cycle, but every remote fact here applies equally to pscalib-calib-speedup and pscalib-numpy-only-8x, which carry their own SETUP.md files. Those two are the historical record of what each campaign assumed at the time and must not be edited. Where they disagree with this file about a LIVE remote fact, this file is newer -- its remote, tools, paths and repo blocks were re-verified first-hand on 2026-08-06.",
+  "how_to_reference": "The contract cites keys as SETUP.<key>, where SETUP means this file -- e.g. SETUP.paths.candidate_worktree_numpy. Resolve a path as paths.project_root + '/' + the relative value under paths._relative_to_project_root. See retarget below for the complete list of values that are site-dependent.",
+
+  "retarget": {
+    "why": "Everything in this file that is machine- or site-dependent is confined to the four values named below. Nothing else in this file contains a literal hostname, username or absolute path -- every other path is expressed as a relative value under paths._relative_to_project_root, or as a template over these values. That is what makes the file portable: a reader on another machine edits these and nothing else.",
+    "paths.project_root": "THE ONE THAT MATTERS. Every path this campaign reads or writes resolves through it: project_root + '/' + a relative value. Retargeting to a different user, project or site is this single edit.",
+    "site.host": "The login node. Only needed to open a connection; no path derives from it.",
+    "site.user": "The account name. site.home is a template over it, so editing site.user is enough.",
+    "site.psana_release": "An absolute path to a third-party production build that is outside project_root and cannot derive from it. It is read-only and nothing in these campaigns writes to it.",
+    "verify_this_claim": "grep -oE '/[a-z][a-zA-Z0-9_./-]*' on this file returns absolute paths only from paths.project_root and the four site.* values above; every other path in the file is relative."
+  },
+
+  "site": {
+    "name": "SLAC S3DF",
+    "host": "sdfiana025",
+    "user": "cwang31",
+    "home": "{site.fs_root}/home/{first_letter_of_user}/{site.user}",
+    "fs_root": "/sdf",
+    "psana_release": "/sdf/group/lcls/ds/ana/sw/conda2/rel/lcls2_070626",
+    "psconda_activate": "{site.fs_root}/group/lcls/ds/ana/sw/conda2/manage/bin/psconda.sh",
+    "invariant": "The host is fixed for these campaigns and nothing runs locally. A number measured on this login node is a SMOKE TEST ONLY -- it is shared and this workload is memory-bandwidth bound, so login-node timings are noisy and pessimistic and are not comparable to any baseline."
+  },
 
   "verified": {
     "first_hand_on": "2026-08-06",
-    "what": "Every entry under remote, tools, paths and repo was re-checked first-hand on 2026-08-06 from a fresh bridge session. The remote is shared and mutable — re-run verification.command rather than trusting this table on a later date.",
+    "what": "Every entry under site, tools, paths and repo was re-checked first-hand on 2026-08-06 from a fresh bridge session. The remote is shared and mutable -- re-run verification.command rather than trusting this table on a later date.",
     "command": "for t in rg fd gcc python3 uv gh git; do command -v $t; done; ls ~/bridge-server; for p in <every resolved paths value>; do [ -e \"$p\" ] && echo OK $p || echo MISS $p; done"
   },
 
-  "remote": {
-    "host": "sdfiana025",
-    "site": "SLAC S3DF",
-    "user": "cwang31",
-    "home": "/sdf/home/c/cwang31",
-    "invariant": "The host is fixed for these campaigns and nothing runs locally. A number measured on this login node is a SMOKE TEST ONLY — it is shared and this workload is memory-bandwidth bound, so login-node timings are noisy and pessimistic and are not comparable to any baseline."
-  },
-
   "local_preconditions": {
-    "note": "Both must hold before iteration 1. Neither is fixable by an agent — one needs a package install, the other an interactive MFA prompt. If either fails, report the blocker plainly, ask the user to resolve it, and stop. Do not work around it and do not mark any done_when item met on a machine that cannot reach the remote.",
+    "note": "Both must hold before iteration 1. Neither is fixable by an agent -- one needs a package install, the other an interactive MFA prompt. If either fails, report the blocker plainly, ask the user to resolve it, and stop. Do not work around it and do not mark any done_when item met on a machine that cannot reach the remote.",
     "cc_bridge_cli": {
       "check": "command -v bridge bridge-session",
       "expect": "two paths",
@@ -33,13 +45,13 @@
       "fixed_by": "user"
     },
     "ssh_non_interactive": {
-      "check": "timeout 25 ssh -o BatchMode=yes -o ConnectTimeout=15 sdfiana025 hostname",
-      "expect": "sdfiana025",
+      "check": "timeout 25 ssh -o BatchMode=yes -o ConnectTimeout=15 <site.host> hostname",
+      "expect": "the value of site.host",
       "why_batchmode": "fails fast instead of hanging on a password or MFA prompt",
       "on_failure": "MFA is the common case on a fresh machine. S3DF requires it through the jump host and it cannot be automated. Ask the user to type `! ssh s3dflogin-mfa.slac.stanford.edu` in the prompt so the output lands in the conversation.",
       "fixed_by": "user, interactively",
       "diagnosis": {
-        "Could not resolve hostname": "no ~/.ssh/config entry — see ssh_config below",
+        "Could not resolve hostname": "no ~/.ssh/config entry -- see ssh_config below",
         "Permission denied (publickey)": "no key, or key not registered at SLAC",
         "hangs or Host key verification failed": "MFA session not established"
       }
@@ -48,22 +60,22 @@
   },
 
   "ssh_config": {
-    "note": "What ~/.ssh/config must contain on the machine you run from. Substitute your own SLAC username for remote.user. A different machine may additionally need IdentityFile.",
+    "note": "What ~/.ssh/config must contain on the machine you run from. Substitute site.user. A different machine may additionally need IdentityFile.",
     "entries": [
-      "Host s3dflogin-mfa.slac.stanford.edu\n  HostName s3dflogin-mfa.slac.stanford.edu\n  User <remote.user>",
-      "Host sdfiana*\n  User <remote.user>\n  ProxyJump s3dflogin-mfa.slac.stanford.edu",
-      "Host sdfmilan*\n  User <remote.user>\n  ProxyJump s3dflogin-mfa.slac.stanford.edu"
+      "Host s3dflogin-mfa.slac.stanford.edu\n  HostName s3dflogin-mfa.slac.stanford.edu\n  User <site.user>",
+      "Host sdfiana*\n  User <site.user>\n  ProxyJump s3dflogin-mfa.slac.stanford.edu",
+      "Host sdfmilan*\n  User <site.user>\n  ProxyJump s3dflogin-mfa.slac.stanford.edu"
     ],
-    "controlmaster": "A ControlMaster socket under ~/.ssh/sockets makes repeat connections fast and avoids re-prompting for MFA. An optimisation, not a requirement — but if it exists and is live, connections are near-instant, which is a useful signal that auth is already established."
+    "controlmaster": "A ControlMaster socket under ~/.ssh/sockets makes repeat connections fast and avoids re-prompting for MFA. An optimisation, not a requirement -- but if it exists and is live, connections are near-instant, which is a useful signal that auth is already established."
   },
 
   "bridge": {
-    "start": "bridge-session start --name <prefix>-<purpose> -- ssh <remote.host> 'uv run ~/bridge-server --root-dir /sdf'",
+    "start": "bridge-session start --name <prefix>-<purpose> -- ssh <site.host> 'uv run ~/bridge-server --root-dir <site.fs_root>'",
     "status": "bridge --session <name> status",
-    "root_dir": "Use --root-dir /sdf (wide). A narrow root only restricts `bridge read` paths; absolute paths inside `bridge bash` work regardless, so a narrow root buys nothing and costs you reads.",
+    "root_dir": "Use --root-dir at site.fs_root (wide). A narrow root only restricts `bridge read` paths; absolute paths inside `bridge bash` work regardless, so a narrow root buys nothing and costs you reads.",
     "session_naming": "Each campaign uses its own prefix so sessions never collide across campaigns: pscalib-* (pscalib-calib-speedup), pscalib2-* (pscalib-numpy-only-8x), pscalib3-* (pscalib-pr-merge-cycle, this one). Never a human-style name (s1, s2) and never another campaign's prefix.",
     "max_concurrent": 3,
-    "why_fresh": "Start your own and inherit none. A leftover session may have a different --root-dir, be stale, or be in use, and sessions serialize — so sharing one silently blocks your commands behind another caller's. One session runs one command at a time, so three is the parallelism ceiling. Stop all of yours when the iteration ends.",
+    "why_fresh": "Start your own and inherit none. A leftover session may have a different --root-dir, be stale, or be in use, and sessions serialize -- so sharing one silently blocks your commands behind another caller's. One session runs one command at a time, so three is the parallelism ceiling. Stop all of yours when the iteration ends.",
     "stopping_others": "A leftover session with a CAMPAIGN prefix is infrastructure and may be stopped. Never stop one with a human-style name.",
     "commands": {
       "run": "bridge --session <n> bash \"<cmd>\"",
@@ -75,7 +87,8 @@
       "Two independent timeouts: the remote one above, and the local Bash tool's own 120 s. For anything long, redirect to a remote file and poll it.",
       "Output caps at 1 MB. Scope rg/fd or redirect and filter remotely.",
       "A command that returns instantly with no output is a QUOTING ERROR, not a negative result. Re-check before believing an absence.",
-      "The remote /bin/sh does not support process substitution `<(...)`. Use temp files."
+      "The remote /bin/sh does not support process substitution `<(...)`. Use temp files.",
+      "`bridge write` reports a CHARACTER count, not a byte count -- it printed 'Wrote 13630 bytes' for a 13682-byte UTF-8 file. That is not corruption. Confirm an upload with md5sum on both sides, never by comparing the printed number (verified first-hand 2026-08-06)."
     ]
   },
 
@@ -87,17 +100,19 @@
       "before_worktrees": "software/_before_worktrees",
       "candidate_worktree_numba": "software/_cand_worktrees/pscalib_cand",
       "candidate_worktree_numpy": "software/_cand_worktrees/pscalib_np8x",
+      "clone_pr19": "software/_cand_worktrees/pscalib_pr19",
       "fixture": "_cand/fixture",
       "campaign1_scratch": "_cand",
       "campaign2_scratch": "_cand2",
       "harness": "_bench_runs/harness/bench_cube_calib.py",
-      "proof_job_output": "_cand2/proof-cubeproof4-34324141.out"
+      "proof_job_output": "_cand2/proof-cubeproof4-34324141.out",
+      "bit_gate": "_cand/bitgate_fixture.py",
+      "bit_gate_runner": "_cand2/bitgate_v5.sh"
     },
-    "psana_release": "/sdf/group/lcls/ds/ana/sw/conda2/rel/lcls2_070626",
     "cautions": [
-      "/sdf/scratch is PURGEABLE — never leave the only copy of anything there.",
-      "/sdf/data/lcls/ds contains both lower- and upper-case hutch directories (mfx and MFX), which inflates any sweep that does not account for it.",
-      "Write nothing outside project_root and the local campaign directory. Never write to another user's /sdf tree."
+      "The site scratch filesystem is PURGEABLE -- never leave the only copy of anything there.",
+      "The LCLS data tree contains both lower- and upper-case hutch directories (mfx and MFX), which inflates any sweep that does not account for it.",
+      "Write nothing outside project_root and the local campaign directory. Never write to another user's tree."
     ]
   },
 
@@ -105,11 +120,12 @@
     "origin": "git@github.com:carbonscott/pscalib.git",
     "default_branch": "main",
     "gh_auth": "authenticated as carbonscott, scopes include repo and workflow",
-    "gh_known_defect": "gh 2.62.0's `gh pr edit` exits 1 on this repo because it queries the deprecated Projects-classic projectCards GraphQL field. It prints only a warning, so the failure is easy to miss — ALWAYS re-fetch the body to confirm an edit landed. Working alternative: gh api -X PATCH /repos/<owner>/<repo>/pulls/<N> -F body=@<file>"
+    "gh_known_defect": "gh 2.62.0 queries the deprecated Projects-classic projectCards GraphQL field on this repo. TWO commands are affected, and the second was found first-hand on 2026-08-06: (1) `gh pr edit` exits 1 and prints only a warning, so an edit that changed nothing is easy to miss -- ALWAYS re-fetch the body to confirm; (2) plain `gh pr view <N>` with NO flags ALSO exits 1 and prints nothing at all, for every PR in this repo. Working alternatives: `gh pr view <N> --json <explicit field list>` (note that `closed` and `merged` are NOT valid pr-view fields on this version -- use closedAt / mergedAt / mergeCommit), the REST form `gh api repos/<owner>/<repo>/pulls/<N>`, and for a body edit `gh api -X PATCH /repos/<owner>/<repo>/pulls/<N> -F body=@<file>`.",
+    "run_tests_in_a_worktree": "run_tests.sh resolves its psdata dependency as $REPO/../psdata/src, which does NOT exist for a worktree or clone that does not sit beside the live psdata checkout. It prints 'WARNING: psdata src not found' and then every psana cross-check test fails on ModuleNotFoundError. Fix by PREPENDING psdata to PYTHONPATH before running -- never by editing the runner: export PYTHONPATH=\"<paths.live_psdata>/src:$PYTHONPATH\" (verified first-hand 2026-08-06)."
   },
 
   "tools": {
-    "note": "Paths verified 2026-08-06. gh, fd, uv and python3 are user-installed under remote.home/.local; rg, gcc and git are system.",
+    "note": "Paths verified 2026-08-06. gh, fd, uv and python3 are user-installed under the account's ~/.local; rg, gcc and git are system.",
     "bridge_server": "~/bridge-server (starts under `uv run`)",
     "gh": "~/.local/bin/gh, version 2.62.0",
     "uv": "~/.local/bin/uv",
@@ -118,24 +134,32 @@
     "rg": "/usr/bin/rg",
     "gcc": "/usr/bin/gcc",
     "git": "/usr/bin/git 2.43.7",
-    "slurm": "/opt/slurm/slurm-curr/bin/{srun,sbatch,squeue}"
+    "slurm": "/opt/slurm/slurm-curr/bin/{srun,sbatch,squeue}",
+    "pytest": "pytest 8.3.3, available inside the psana release (site.psana_release); the acceptance suite does not use it -- run_tests.sh invokes each test file with python3 directly"
   },
 
   "measurement_env": {
     "where": "milano nodes via slurm (sdfmilan*), 120 CPU / 503 GiB, --exclusive. NOT the login node.",
-    "psana_release": "see paths.psana_release — python 3.9.20, numpy 1.26.4",
+    "psana_release": "see site.psana_release -- python 3.9.20, numpy 1.26.4",
     "rules": [
       "512 events, never 128. At 128 events bit-identical code produced ratios of 4.31x and 1.33x depending on arm order, driven by page-cache warming.",
-      "Serialize your own jobs and check node exclusivity before submitting. Three runs in the first campaign were destroyed by an I/O storm from that campaign's own concurrent xtc readers. --exclusive protects the CPUs, not Weka.",
+      "Serialize your own jobs and check node exclusivity before submitting. Three runs in the first campaign were destroyed by an I/O storm from that campaign's own concurrent xtc readers. --exclusive protects the CPUs, not the parallel filesystem.",
       "Check arm symmetry by BYTES READ, never by MB_per_s. MB_per_s is nbytes/wall with nbytes fixed by the event count, so an MB/s symmetry rule is a wall-time symmetry test in disguise and any real speedup above ~1.18x must fail it.",
       "Re-measure the denominator in the same job. Anchoring on a baseline from a prior job produced a 33% unexplained incumbent-arm slowdown that nobody could account for.",
-      "BENCH_WORKERS is read from the env and split on COMMA, so BENCH_WORKERS='1 16' kills the harness before argparse — unset it."
+      "BENCH_WORKERS is read from the env and split on COMMA, so BENCH_WORKERS='1 16' kills the harness before argparse -- unset it."
     ],
     "not_needed_for_every_campaign": "The three-conjunct bit gate is psana-free, runs on paths.fixture, and needs no node allocation. A campaign that changes no compute path needs no slurm time at all."
   },
 
+  "bit_gate": {
+    "what": "The three-conjunct byte-exactness proof. Conjuncts, all required: (1) isnan(a) and isnan(b) are the same array; (2) on the non-NaN set, a.view(uint32) == b.view(uint32) elementwise; (3) signbit(a) == signbit(b) everywhere a == 0. Plus dtype float32, identical shape, and max|diff| over the both-finite set computed in float64 exactly 0.0.",
+    "why_not_maxabsdiff": "A plain max|diff| == 0 check is a PROVEN HOLE, twice over: it cannot see -0.0 vs +0.0, and the reference DOES produce negative zeros (215..4456 pixels per fixture frame); and np.max(np.abs(a-b)) is NaN whenever either side holds a NaN, so a naive gate fails closed on correct output.",
+    "how": "Run paths.bit_gate_runner. It sources site.psconda_activate, puts the candidate worktree's src/ on PYTHONPATH, prints GITHEAD and an md5 over all src/*.py, then runs paths.bit_gate at 10 configurations: defaults plus PSCALIB_CALIB_TILE_ROWS in {32,128,512} x PSCALIB_CALIB_DENSE_FRAC in {0.0,0.60,1e9}. Psana-free, no slurm, minutes.",
+    "what_to_check": "GITHEAD equals the SHA under test; 10 lines of `GATE ... EXIT=0`; 10 lines of `BITGATE OVERALL maxabsdiff=0 PASS=True`; and 80 per-frame lines (8 frames x 10 configs) matching `maxabsdiff=0 bitdiffs=0 signzerodiffs=0 nanmask_equal=True`, with zero non-conforming lines."
+  },
+
   "unowned_code": {
-    "finding": "The benchmark harness at paths.harness is NOT under version control — `git rev-parse` in its directory reports no repo (verified 2026-08-06).",
+    "finding": "The benchmark harness at paths.harness is NOT under version control -- `git rev-parse` in its directory reports no repo (verified 2026-08-06).",
     "consequence": "There is no upstream to contribute the harness patch to. The patcher script and a written-up pattern are the only durable homes for it, which is why the numpy campaign shipped docs/fast-event-loops.md plus an extra/ archive rather than an upstream PR."
   },
 
@@ -145,12 +169,16 @@
     "ssh hangs with no output": "MFA needed; stop and ask the user to log in",
     "bridge bash returns instantly and empty": "quoting error, not an empty result",
     "bridge bash output truncated": "hit the 1 MB cap; redirect and filter remotely",
+    "bridge write printed fewer bytes than the file has": "it counts characters, not bytes; verify with md5sum, not with the printed number",
     "command killed at ~120 s": "local Bash timeout; background it remotely and poll a file",
     "slurm job pending indefinitely": "queue contention; record the job id and poll, do not resubmit blind",
     "timings ~3x worse than baseline": "measured on the login node; re-run under srun on milano",
     "ValueError before argparse": "BENCH_WORKERS is set and split on commas; unset it",
-    "gh pr edit prints a warning and changes nothing": "the Projects-classic defect; use the gh api PATCH form and re-fetch to confirm"
+    "gh pr edit prints a warning and changes nothing": "the Projects-classic defect; use the gh api PATCH form and re-fetch to confirm",
+    "gh pr view prints nothing and exits 1": "the same Projects-classic defect on the plain view path; pass --json with an explicit field list, or use gh api",
+    "gh pr view --json exits 1 listing valid field names": "you asked for a field this gh version does not have; `closed` and `merged` are not pr-view fields, use closedAt / mergedAt",
+    "every psana cross-check test fails on ModuleNotFoundError: psdata": "run_tests.sh looked for $REPO/../psdata/src and did not find it; prepend paths.live_psdata/src to PYTHONPATH"
   },
 
-  "not_verified": "The ssh_config block reflects what worked on the authoring machine; a different machine may need IdentityFile or a different jump-host alias. Whether CI exists on the pscalib repo, and whether any of its test suite runs off-SLAC, has never been checked — most tests require psana, which is a SLAC production conda build and not pip-installable."
+  "not_verified": "The ssh_config block reflects what worked on the authoring machine; a different machine may need IdentityFile or a different jump-host alias. Whether CI exists on the pscalib repo, and whether any of its test suite runs off-SLAC, has never been checked -- most tests require psana, which is a SLAC production conda build and not pip-installable."
 }

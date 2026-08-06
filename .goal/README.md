@@ -2,12 +2,12 @@
 
 This directory is a **historical record**, not configuration and not tooling.
 Nothing in `src/pscalib/` reads it, and the test suite does not touch it. It is
-committed because this repository carries the work of two development efforts —
-one closed without merging but recoverable from its branch, one still in review
-at the time of this commit — and these files are the honest provenance of how
-that work was produced: what
-was assumed, what was measured, what was disbelieved and re-measured, and which
-claims were verified first-hand versus taken on report.
+committed because `main` carries the commits of two development efforts — the
+numba implementation, whose pull request was closed unmerged, and the numpy-only
+implementation that shipped — and these files are the honest provenance of how
+that work was produced: what was assumed, what was measured, what was
+disbelieved and re-measured, and which claims were verified first-hand versus
+taken on report.
 
 ## What is here
 
@@ -15,8 +15,8 @@ Two completed efforts, each as a four-file set:
 
 | Set | Files | What it produced |
 | --- | --- | --- |
-| `pscalib-calib-speedup` | `.json` (contract), `.ledger.json`, `.claims.json`, `.SETUP.md` | The first fast jungfrau calibration path, implemented with numba. Its head commit is preserved on its own branch and recoverable from there; it is **not** in `main`'s history and was **not** merged as the shipping implementation. |
-| `pscalib-numpy-only-8x` | `.json` (contract), `.ledger.json`, `.claims.json`, `.SETUP.md` | The shipping implementation: the same speed with **numpy alone**, no numba and no new runtime dependency. This is what `src/pscalib/apply/_fastcalib.py` is; it arrives with its own pull request and is not on `main` as of this commit. |
+| `pscalib-calib-speedup` | `.json` (contract), `.ledger.json`, `.claims.json`, `.SETUP.md` | The first fast jungfrau calibration path, implemented with numba. Its pull request was closed unmerged, as superseded rather than rejected on merit — but its commits reached `main` inside the shipping branch's history, so head commit `5c432ec` is an ancestor of `main` and the numba implementation stays recoverable from history. |
+| `pscalib-numpy-only-8x` | `.json` (contract), `.ledger.json`, `.claims.json`, `.SETUP.md` | The shipping implementation: the same speed with **numpy alone**, no numba and no new runtime dependency. This is what `src/pscalib/apply/_fastcalib.py` is; it was merged into `main` with its history preserved, which is how the numba effort's commits came along with it. |
 
 Plus one live document:
 
@@ -51,9 +51,21 @@ these files to use this repository, because nothing in this repository reads
 them.
 
 New portability work therefore went into exactly one file:
-`pscalib-pr-merge-cycle.SETUP.json`, which resolves every machine- and
-site-dependent fact through a single editable value, `paths.project_root`.
-Retargeting it to another user, project or site is a one-line edit.
+`pscalib-pr-merge-cycle.SETUP.json`. It confines every machine- and
+site-dependent fact to the four values named in its own `retarget` block, and
+`paths.project_root` is the only one any path depends on — every other path in
+that file is relative to it. Retargeting to another user, project or site is
+that single edit; the remaining three are the login host, the account name and
+the absolute path of a third-party production build that sits outside the
+project tree and cannot be derived from it.
+
+For the same reason, a recursive grep for a hostname, a username or an absolute
+site path over this directory does **not** come back empty, and should not be
+expected to. Outside `pscalib-pr-merge-cycle.SETUP.json` and the two `SETUP.md`
+files, the hits are in four frozen records — the two older contracts and the
+first effort's ledger and claims — plus `pscalib-numpy-only-8x`'s ledger and
+claims, whose only hits are compute-node names recording where a job ran. None
+of them is a value a reader must edit.
 
 ## What is deliberately absent
 
