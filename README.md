@@ -92,6 +92,26 @@ plugin. There is **no `det_type` argument** in this form. (An explicit form,
 `pscalib.calib(det_type, raw, constants, config=None)`, is also accepted when you
 want to pin the type yourself.)
 
+### Reusing the output buffer (`out=`)
+
+`pscalib.calib` accepts an optional pre-allocated destination:
+
+```python
+cal_buf = np.empty((32, 512, 1024), dtype=np.float32)
+cal = pscalib.calib(raw, constants, out=cal_buf)
+```
+
+This exists for per-event loops, where first-touching a fresh 67 MB output on
+every event is a measurable cost. `out=` changes *where* the result is written,
+never *what* is computed, and `out=None` — every existing call — is unaffected.
+
+Reusing the buffer is one of five caller-side moves that together take a
+jungfrau event loop from 116.1 to 76.9 ms/event with a **bit-identical** result.
+The other four — a prefetch thread, an all-finite fast path, a deferred `nvalid`
+map, a reused segment stack — live in your loop rather than in `pscalib`, and
+are written up with their bit-exactness arguments and their traps in
+**[docs/fast-event-loops.md](docs/fast-event-loops.md)**.
+
 ### Validity enforcement (refuse-by-default)
 
 Pass the run you are calibrating to enforce that the constants are valid for it
