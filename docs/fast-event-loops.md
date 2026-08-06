@@ -21,20 +21,28 @@ run=51`, 512 events at 33.5 MB/event, `workers=1`, slurm job 34324141. Same
 `pscalib`, same events, same node; the only difference is the loop around
 `calib()`.
 
-| | naive loop | with these five moves |
-|---|---|---|
-| **end-to-end** | **116.1 ms/event** | **76.9 ms/event** |
-| read | 8.2 (serial) | 9.1 (overlapped, `overlap_f=0.9692`) |
-| stack | 7.9 | 7.0 |
-| `pscalib.calib()` | 42.2 | 40.2 |
-| accumulate | 41.7 | 15.0 |
+**The result.** Cost per event at `workers=1`, lower is better:
 
-**1.51× on the loop**, with `pscalib` held fixed.
+| Event loop | ms/event | Speedup |
+|---|---:|---:|
+| naive | 116.1 | 1.00× |
+| **with these five moves** | **76.9** | **1.51×** |
 
-Read the decomposition as indicative, not load-bearing: `accumulate` is a
-residual (`compute − stack − calib`), not an independent timer, and the
-`read` row is wall-clock inside a thread rather than time on the critical path.
-The 116.1 → 76.9 end-to-end figure is the measured one.
+**Where the time goes.** Same job, measured in-situ at 512 events, `nbins=10`:
+
+| Stage | Naive (ms/event) | Patched (ms/event) | Which move |
+|---|---:|---:|---|
+| read | 8.16 | 9.10 | 1 — prefetch (`overlap_f` 0.0000 → 0.9692) |
+| segment stack | 7.91 | 6.98 | 5 — reused buffer |
+| `pscalib.calib()` | 42.17 | 40.24 | 2 — `out=` buffer |
+| accumulate | 41.70 | 14.98 | 3 + 4 — fast path, deferred `nvalid` |
+| **total** | **99.94** | **62.48** | |
+
+Read the second table as indicative rather than load-bearing. The `read` row is
+wall-clock inside the reader thread rather than time on the critical path — at
+`overlap_f=0.9692` almost none of it is — and `accumulate` is a residual
+(`compute − stack − calib`), not an independent timer. The 116.1 → 76.9
+end-to-end figure in the first table is the measured one.
 
 ## 1. Overlap the read with a prefetch thread
 
