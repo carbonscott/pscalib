@@ -823,6 +823,38 @@ def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
             "backend must be 'auto', 'numpy' or 'numba'; got %r "
             "(use pscalib.apply.jungfrau.calib_jungfrau_reference for the "
             "verbatim reference)" % (backend,))
+
+    # ---- SIGNED / non-unsigned raw: route to the verbatim reference ------
+    # The reference classifies the gain code as ``(arr >> 14).astype(np.uint8)``,
+    # so a NEGATIVE word yields 255, which matches none of (0, 1, 3) and
+    # therefore falls to the ``np.select`` DEFAULT lane (pedoff 0.0, factor 0.0)
+    # and renders as 0.0.  The numpy hybrid's classifier ``a >= 0x4000`` is
+    # False for every negative word, so such a pixel never enters the residual
+    # set nor the gather fixup and silently keeps its stage-0 base value -- an
+    # error of order 3e4 ADU, not a sign-of-zero.  The numba kernel uses
+    # ``(v >> 14) & 0xFF``, which wraps as the reference does, so the two
+    # backends also DISAGREED with each other on signed input.
+    # Real jungfrau raw is uint16 (the dataset, the fixture and the public
+    # docstring all say so), so this was latent and no measured number in this
+    # campaign is affected -- but the pure-numpy path is the byte-exact
+    # fallback and must stay one.  Deferring to the reference fixes both the
+    # exactness gap and the backend disagreement by construction.
+    if raw.dtype.kind != "u":
+        from .jungfrau import calib_jungfrau_reference
+        res = calib_jungfrau_reference(raw, ped_src, gain_src,
+                                       pixel_offset=off_src, mask=mask)
+        if out is not None:
+            out[...] = res
+            res = out
+        LAST_CALL.clear()
+        LAST_CALL.update({
+            "backend_used": "reference",
+            "reference_reason": "raw.dtype=%s is not unsigned; the fast "
+                                "classifiers are only sound for unsigned raw"
+                                % (raw.dtype,),
+        })
+        return res
+
     used = backend
     if backend == "auto":
         used = "numba" if _numba_usable(raw, mprep, poff, gfac) else "numpy"
