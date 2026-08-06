@@ -14,6 +14,11 @@ two leaf plugins over the pure-numpy gain decoders in :mod:`pscalib.apply`.
   * ``config`` is the per-segment Configure object the detector needs to decode
     its gain (psdata's ``Run.seg_configs(detname)``).  jungfrau ignores it (its
     gain is in the raw bits); epix10ka *requires* it.
+  * ``out`` is an OPTIONAL, backwards-compatible extension of that contract:
+    ``plugin(raw, constants, config=None, out=None)``.  A plugin that does not
+    declare it is never handed one -- :func:`calib` only forwards ``out=`` after
+    introspecting the plugin's signature, and refuses loudly otherwise, so every
+    plugin written against the three-argument contract keeps working unchanged.
 
 This module is the registry US-005's unified ``pscalib.calib(raw, constants,
 config=None)`` dispatches through; US-004 lands it with the jungfrau + epix10ka
@@ -26,6 +31,7 @@ import os
 import numpy as np
 
 from .apply.jungfrau import calib_jungfrau, N_GAIN_STAGES as _JF_STAGES
+from .apply._fastcalib import memo as _memo
 from .apply.epix10ka import calib_epix10ka, mask_from_pixel_status
 
 __all__ = [
@@ -357,7 +363,12 @@ def _optional_const(constants, ctype, like, fill):
     val = _get_const(constants, ctype, required=False)
     if val is not None:
         return val
-    return np.full_like(np.asarray(like, dtype=np.float32), fill)
+    # HOIST: the fabricated default is a pure function of ``like``'s shape and
+    # ``fill``, but this runs on EVERY event, so a fresh 201 MB array per event
+    # was being allocated, filled and thrown away (and, being a new object each
+    # time, it also defeated the derived-constant memo downstream).
+    return _memo((like,), ("optional_const", ctype, float(fill)),
+                 lambda: np.full_like(np.asarray(like, dtype=np.float32), fill))
 
 
 # ==========================================================================
@@ -477,7 +488,32 @@ def _assert_constants_bind_raw(family, raw, constants):
 # ==========================================================================
 # Built-in plugins (the thin seam): plugin(raw, constants, config=None) -> calib
 # ==========================================================================
-def plugin_jungfrau(raw, constants, config=None):
+def _hoisted_status_mask(status, status_bits=0xffff,
+                         gain_range_inds=(0, 1, 2, 3, 4)):
+    """:func:`mask_from_pixel_status` HOISTED across events.
+
+    The default mask is a pure function of the ``pixel_status`` CONSTANT, which
+    is fetched once per run -- yet the plugins rebuilt it on every single event,
+    and it was the single most expensive step in the whole apply (45-56% of the
+    per-event calib cost for a jungfrau: a 402 MB int64 ``np.select`` transient
+    plus two more merges, per event, to recompute the same 16 MB of bytes).
+
+    The memo is keyed on the IDENTITY of the ``status`` array (eviction-safe --
+    see :func:`pscalib.apply._fastcalib.memo`) plus the two scalar parameters, so
+    a different ``pixel_status`` object, or the same one with different
+    ``status_bits``, derives afresh.  The PUBLIC
+    :func:`~pscalib.apply.epix10ka.mask_from_pixel_status` is deliberately NOT
+    memoised: it still returns a fresh array every call, so a caller that mutates
+    the result is unaffected.  Only this internal plugin path shares.
+    """
+    return _memo((status,), ("status_mask", int(status_bits),
+                             tuple(gain_range_inds)),
+                 lambda: mask_from_pixel_status(
+                     status, status_bits=status_bits,
+                     gain_range_inds=gain_range_inds))
+
+
+def plugin_jungfrau(raw, constants, config=None, out=None):
     """Jungfrau apply plugin -- gain stage is in the raw bits, ``config`` unused.
 
     Pulls ``pedestals`` / ``pixel_gain`` (+ optional ``pixel_offset`` / ``mask``)
@@ -490,6 +526,11 @@ def plugin_jungfrau(raw, constants, config=None):
     byte-exact too -- psana's ``det.raw.calib(evt)`` masks bad pixels, so a
     web/BYO apply that skipped masking would differ.  If neither is available,
     no mask is applied.
+
+    ``out`` is the OPTIONAL pre-allocated output buffer (default ``None`` ==
+    allocate, i.e. exactly the previous behaviour).  It is passed straight
+    through to :func:`~pscalib.apply.jungfrau.calib_jungfrau`, which validates
+    it and raises on a dtype/shape mismatch rather than quietly allocating.
     """
     pedestals = _get_const(constants, "pedestals")
     # CAL-04: pixel_gain is OPTIONAL -- psana defaults an absent gain to ones
@@ -502,12 +543,12 @@ def plugin_jungfrau(raw, constants, config=None):
     if mask is None:
         status = _get_const(constants, "pixel_status", required=False)
         if status is not None:
-            mask = mask_from_pixel_status(status)
+            mask = _hoisted_status_mask(status)
     return calib_jungfrau(raw, pedestals, pixel_gain,
-                          pixel_offset=pixel_offset, mask=mask)
+                          pixel_offset=pixel_offset, mask=mask, out=out)
 
 
-def plugin_epix10ka(raw, constants, config=None):
+def plugin_epix10ka(raw, constants, config=None, out=None):
     """epix10ka apply plugin -- ``config`` (per-segment Configure) is REQUIRED.
 
     Pulls ``pedestals`` / ``pixel_gain`` from the constants mapping and the
@@ -519,7 +560,31 @@ def plugin_epix10ka(raw, constants, config=None):
     the default status mask is derived (:func:`mask_from_pixel_status`) so the
     BYO / web path is byte-exact too.  If neither is available, no mask is
     applied.
+
+    ``out`` is ACCEPTED AND REJECTED here, deliberately.  The epix10ka decode
+    (:func:`~pscalib.apply.epix10ka.calib_epix10ka`) builds its result through
+    whole-array temporaries and ends in ``out.astype(np.float32)``; there is no
+    in-place write path to thread a buffer into, so honouring ``out=`` would
+    mean an extra full-size COPY into the caller's buffer -- strictly MORE work
+    than not passing it, while looking like an optimisation.  Threading it
+    properly means rewriting that kernel, which is a different piece of work
+    with its own byte-exactness proof to earn.  Until then this raises a clear
+    error instead of (a) silently ignoring the buffer, which would leave the
+    caller reading stale data from the previous event, or (b) silently paying
+    for a copy the caller asked to avoid.  ``out=None`` -- every existing
+    caller -- is completely unaffected.
     """
+    if out is not None:
+        raise NotImplementedError(
+            "the epix10ka apply plugin does not support out= yet: its decode "
+            "materialises whole-array temporaries and finishes with "
+            "out.astype(np.float32), so there is nothing to write a "
+            "caller-supplied buffer into without an extra full-size copy -- "
+            "which would cost MORE than the allocation out= is meant to save. "
+            "Call pscalib.calib(...) without out= (the returned array is "
+            "freshly allocated, exactly as before). out= is currently "
+            "implemented for the jungfrau family only, where the kernel writes "
+            "its result in place.")
     if config is None:
         raise ValueError(
             "epix10ka apply requires the per-segment Configure object "
@@ -545,7 +610,7 @@ def plugin_epix10ka(raw, constants, config=None):
     if mask is None:
         status = _get_const(constants, "pixel_status", required=False)
         if status is not None:
-            mask = mask_from_pixel_status(status)
+            mask = _hoisted_status_mask(status)
     return calib_epix10ka(raw, pedestals, pixel_gain, config, mask=mask)
 
 
@@ -588,8 +653,47 @@ def _enforce_validity(constants, run, allow_stale, log):
     check_validity(validities, run, allow_stale=allow_stale, pin=pin, log=log)
 
 
+#: plugin -> does it accept an ``out=`` keyword?  Answered ONCE per plugin with
+#: :mod:`inspect` and cached, because ``calib`` is a per-EVENT call site and
+#: ``inspect.signature`` is far too slow to run on every frame.
+_PLUGIN_OUT_SUPPORT = {}
+
+
+def _plugin_accepts_out(plugin):
+    """Does ``plugin`` take an ``out=`` keyword?  Introspected, never assumed.
+
+    Plugins are user-registerable (:func:`register`) and the documented contract
+    is ``plugin(raw, constants, config=None) -> calib``, so a third-party plugin
+    predating ``out=`` must NOT be handed one.  Asking the signature first turns
+    that into a clear refusal at the ``calib`` boundary instead of an opaque
+    ``TypeError: got an unexpected keyword argument 'out'`` from inside someone
+    else's function -- and, unlike catching TypeError around the call, it cannot
+    mistake a genuine TypeError raised *inside* the plugin for an arity problem.
+    """
+    try:
+        known = _PLUGIN_OUT_SUPPORT.get(plugin)
+    except TypeError:                       # unhashable callable: ask every time
+        known = None
+    if known is not None:
+        return known
+    import inspect
+    try:
+        params = inspect.signature(plugin).parameters
+    except (TypeError, ValueError):         # builtins / C callables: unknowable
+        ok = False
+    else:
+        ok = ("out" in params
+              or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                     for p in params.values()))
+    try:
+        _PLUGIN_OUT_SUPPORT[plugin] = ok
+    except TypeError:
+        pass
+    return ok
+
+
 def calib(*args, config=None, run=None, allow_stale=False, log=None,
-          allow_unvalidated=False):
+          allow_unvalidated=False, out=None):
     """Apply calibration constants to ``raw`` in pure numpy -- the public surface.
 
     Two call forms share this one entry point (and one registry dispatch):
@@ -658,11 +762,29 @@ def calib(*args, config=None, run=None, allow_stale=False, log=None,
         Opt in to applying the family plugin to a version triple that is not in
         the family's validated set (CAL-15).  Refuse-by-default (``False``);
         set ``True`` only when you have independently confirmed byte-exactness.
+    out : numpy.ndarray, optional
+        Pre-allocated output buffer, ``raw.shape`` / float32.  Default ``None``
+        allocates a fresh array and behaves EXACTLY as before -- this keyword
+        changes nothing for any existing caller.  It exists for the per-event
+        loop: cubing a jungfrau run allocates and first-touches a fresh 67 MB
+        float32 frame every event (measured 5.77 ms of page faults vs 3.45 ms
+        into a reused buffer), which a caller that owns the lifetime of the
+        result can simply stop paying.
+
+        The output is BIT-IDENTICAL with and without it (the kernels assign
+        every element of the result either way), which is gated in-tree against
+        the frozen reference.  Mismatched dtype/shape RAISES; it is never
+        silently ignored, because a caller that thought it had a reused buffer
+        and did not would read the PREVIOUS event's data out of it.  Supported
+        by the jungfrau family; the epix10ka plugin refuses ``out=`` explicitly
+        (see :func:`plugin_epix10ka`), as does any third-party plugin whose
+        signature predates the keyword.
 
     Returns
     -------
     numpy.ndarray
-        The calibrated stack (byte-exact vs ``det.raw.calib(evt)``).
+        The calibrated stack (byte-exact vs ``det.raw.calib(evt)``).  This IS
+        ``out`` when ``out`` was supplied and the plugin honours it.
     """
     if args and isinstance(args[0], str):
         # explicit form: calib(det_type, raw, constants)
@@ -698,4 +820,19 @@ def calib(*args, config=None, run=None, allow_stale=False, log=None,
     # clear error instead of silently producing a wrong image.
     _assert_constants_bind_raw(norm, raw, constants)
     _enforce_validity(constants, run, allow_stale, log)
-    return get_plugin(norm)(raw, constants, config=config)
+    plugin = get_plugin(norm)
+    if out is None:
+        # The pre-existing call, byte-for-byte.  No introspection, no extra
+        # keyword: a plugin written against the documented three-argument
+        # contract sees exactly what it always saw.
+        return plugin(raw, constants, config=config)
+    if not _plugin_accepts_out(plugin):
+        raise TypeError(
+            "out= was requested but the %r plugin (%s) does not accept it; its "
+            "signature is the original plugin(raw, constants, config=None). "
+            "Refusing rather than dropping the buffer on the floor: a caller "
+            "that believes it is reusing a buffer, and is not, reads the "
+            "PREVIOUS event's pixels out of it. Call without out=, or register "
+            "a plugin that takes it."
+            % (norm, getattr(plugin, "__name__", repr(plugin))))
+    return plugin(raw, constants, config=config, out=out)

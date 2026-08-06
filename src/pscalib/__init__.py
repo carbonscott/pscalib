@@ -68,6 +68,13 @@ from . import registry    # noqa: F401  (det_type -> apply plugin dispatch; US-0
 
 from .apply.jungfrau import calib_jungfrau
 from .apply.epix10ka import calib_epix10ka, mask_from_pixel_status
+# The derived-constants cache behind the fast jungfrau path is unbounded and
+# keyed on array IDENTITY, so it cannot see an in-place mutation of a constants
+# array.  Its four diagnostics / escape hatches are surfaced at the top level
+# alongside the apply functions they belong to -- see
+# :func:`pscalib.apply.jungfrau.calib_jungfrau` for the contract they enforce
+# socially.
+from .apply import memo_clear, memo_nbytes, memo_size, memo_stats
 from .geometry import (
     pixel_coord_indexes_from_text,
     cache_pixel_indexes_for_snapshot,
@@ -96,6 +103,7 @@ __all__ = [
     "validities_from_calibconst", "detector_type_hint",
     "calib_jungfrau",
     "calib_epix10ka", "mask_from_pixel_status",
+    "memo_clear", "memo_nbytes", "memo_size", "memo_stats",
     "registry", "calib", "register", "get_plugin", "registered_types",
     "detector_type_of", "detector_type_for_constants",
     "pixel_coord_indexes_from_text", "cache_pixel_indexes_for_snapshot",
