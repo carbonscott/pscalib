@@ -1,0 +1,222 @@
+{
+  "goal": "Take jungfrau cube throughput at workers=1 from the measured 645.3 ms/event to at most 80.7 ms/event -- at least 8.0x -- using numpy alone, with no numba anywhere in pscalib, while holding byte-exactness against the pure-numpy reference, purity of that reference path, partition invariance, and a bit-identical binned cube.",
+  "slug": "pscalib-numpy-only-8x",
+  "claims": [
+    {
+      "id": "C1",
+      "provenance": "verified",
+      "claim": "Fixture ms/frame UNDERSTATES the candidate's ms/event by ~9%, because the candidate is far more non-G0-fraction-sensitive than the incumbent and the fixture's mean fraction (0.1621) is below the harness's (0.20265). For the chosen kernel v5 @ tile_rows=512 the corrected figure is 37.84 ms/event, not the fixture's 34.47.",
+      "evidence": "I recomputed this myself from two inputs I surfaced: the per-frame milano timings of job 34316936 ('KLAB TIME v5 frame=0..7' at fracs 0.0000..0.6424, ms 14.67..68.02) and the harness's own 512-event fraction distribution in _cand/skeptic/mix512_login.log ('mean=0.202650 median=0.113395 ... deciles: 0.0000 0.0008 0.0168 0.0493 0.0848 0.1134 0.1533 0.1961 0.3826 0.5820 0.9949'). Two independent methods agree: a linear fit ms = 20.987 + 83.159*frac (R2=0.8856) evaluated at the harness mean gives 37.84 (inflation 1.098), and a decile-midpoint integration of the measured curve, clamped above the fixture's max frac where the contract says the curve saturates, gives 37.37 (inflation 1.084). I adopt the larger, less favourable value."
+    },
+    {
+      "id": "C2",
+      "provenance": "verified",
+      "claim": "The existing candidate's PURE-NUMPY path costs 52.92 ms/frame mean on the same node and frames, i.e. 10.5x faster than the incumbent with numpy alone before this campaign changes anything.",
+      "evidence": "same job 34315699; 'MB SUMMARY tag=cand_numpy ... mean_calib_ms=52.92', BACKEND_INFO backend=numpy used=numpy tile_rows=128 dense_frac=0.6, SHA 5c432ecd2df495c008a63d99500a07a4542ca142 MATCH=YES."
+    },
+    {
+      "id": "C3",
+      "provenance": "inferred",
+      "claim": "The harness accumulate block costs MORE than the 35.3 ms the contract budgets, and np.where is its largest single term. The specific value 43.94 is QUARANTINED as too SMALL: the microbench uses one bin where the harness runs nbins=10, and in-situ measurements put it at 49-72 ms.",
+      "evidence": "Job 34315699 'MB ACCUM ... where_ms=16.73 ... total_ms=43.94' which I read myself, versus the skeptic's in-situ smokes accum_ms=49.31/66.91/71.83 on real harness events. The inequality against 35.3 holds under every estimate; the point value does not."
+    },
+    {
+      "id": "C4",
+      "provenance": "verified",
+      "claim": "Folding the mask into the gain planes (gfm = gfac*mask) is BIT-EXACT under a once-per-run guard and is NOT exact without it; the guard holds on the real constants with enormous margin.",
+      "evidence": "semcheck.py run under the psana env numpy 1.26.4 on sdfiana025: '[M5] finite, non-overflowing, m in {0,1}  nanmask_diff=0 bitdiff=0 signzerodiff=0 nanpayload_diff=0 ok', and the adversarial overflow row printing (x*g)*m = all-nan versus x*(g*m) = [0 -0 -0 nan nan nan nan]. kernel_lab on the real fixture: 'KLAB FOLD_GUARD ok=True ok: max|poff|=1.644e+04 max|gfac|=62.5 mask in {0,1}; worst |x*g| <= 1.000e+30 < 3.403e+38'."
+    },
+    {
+      "id": "C5",
+      "provenance": "verified",
+      "claim": "The fused subtract (M1) and dropping the &MSK in the sparse-gather case (M2) are bit-identical for unsigned raw; M1 additionally requires an explicit dtype=np.float32 or uint32/uint64 raw would silently double-round.",
+      "evidence": "semcheck.py output on sdfiana025: M1 rows for uint8/uint16/uint32/uint64 all 'bitdiff=0 signzerodiff=0 nanpayload_diff=0 ok' including an EXHAUSTIVE sweep of all 65536 uint16 values with adversarial poff; M2 rows 'and_is_noop_below_0x4000=True every_high_word_in_resid=True ok' for uint16/uint32/uint64. The dtype= requirement is the planner's argument, adopted and encoded in kernel_lab.py's _SUB_DTYPE."
+    },
+    {
+      "id": "C6",
+      "provenance": "verified",
+      "claim": "Interleaving the stage-1 pedestal and gain planes into one (seg,row,col,2) array to halve the gather's cache-line touches is a measured LOSS and is rejected.",
+      "evidence": "kernel_lab.py login-node smoke, frames 0/3/7: 'KLAB SUMMARY variant=v3 ... mean_ms=39.31' versus 'KLAB SUMMARY variant=v4 ... mean_ms=54.69', both gate=PASS. Login-node timings are indicative only, but a 39% regression is far outside that noise."
+    },
+    {
+      "id": "C7",
+      "provenance": "verified",
+      "claim": "Every candidate kernel variant built so far passes the three-conjunct bit gate against the frozen c5ce538 reference on real frames, and the -0.0 conjunct is genuinely exercised.",
+      "evidence": "job 34315699 'BITGATE OVERALL maxabsdiff=0 bitdiff=0 signzerodiff=0 PASS=True' for tag=incumbent, tag=cand_numpy and tag=cand_numba, with per-frame DETAIL lines showing negzero populations of 215..4456; kernel_lab login smoke 'KLAB GATE v0/v1/v2/v3/v4 ... PASS' on frames 0,3,7."
+    },
+    {
+      "id": "C8",
+      "provenance": "verified",
+      "claim": "A numba-free candidate worktree exists: branch cand/calib-numpy-8x at commit 903888b in _cand_worktrees/pscalib_np8x, branched from the untouched PR-#17 branch cand/calib-speedup at 5c432ec.",
+      "evidence": "git -C .../pscalib_np8x log --oneline -3 printed '903888b refactor(calib): delete the optional JIT backend -- numpy is the only backend' over '5c432ec fix(calib): signed raw must defer...'. I ran this git command myself. The numba-free GREP proof and the import-without-numba proof are the worker's, not yet re-verified by me."
+    },
+    {
+      "id": "C9",
+      "provenance": "inferred",
+      "claim": "The 8.0x target is reachable only if the psdata read overlaps compute: with the read serialized, the remaining budget for calib is below its own DRAM floor.",
+      "evidence": "Arithmetic on measured terms: target 80.66 ms/event; measured accumulate floor about 19 ms after the all-finite fast path, stack 10.36 ms measured by the predecessor campaign, calib DRAM floor 22 ms per the contract. 80.66 - 38.7(read) - 10.4 - 19 = 12.6 ms of calib budget against a 22 ms floor. NOT yet measured -- the overlap probe is iteration 2's first task."
+    },
+    {
+      "id": "C10",
+      "provenance": "inferred",
+      "claim": "The three-arm proof job is exposed to page-cache contamination that biases every known way toward passing, because 512 events x 33.5 MB fits in the node's 503 GiB and later arms read warm.",
+      "evidence": "The predecessor campaign's own READSPLIT2_milano.txt records a cold read at 3124 ms/event versus 21.75 ms/event on an immediate warm re-read of the same events. Mitigation adopted from the planner: a FOURTH arm repeating before_orig last, required to land within 10% of the first before_orig."
+    },
+    {
+      "id": "C11",
+      "provenance": "verified",
+      "claim": "A stdlib prefetch thread genuinely overlaps psdata's read with numpy compute: the overlap fraction is 0.879 cold and 0.866-0.913 warm, against a hard ceiling of 0.875 for 8 batches. The contract's 8.0x target is therefore not blocked by the GIL.",
+      "evidence": "slurm job 34316936, node sdfmilan253, exclusive; lines 'OVERLAP phase=cold SELF ... f_self=0.8787', 'OVERLAP phase=warm SELF ... f_self=0.8657', 'OVERLAP phase=warm_prefetch2 SELF ... f_self=0.9131', with the explicit ceiling line 'f_ceiling=0.8750 (=1-1/n_batches...)'. I read these lines myself from the job's .out file."
+    },
+    {
+      "id": "C12",
+      "provenance": "verified",
+      "claim": "The chosen kernel configuration -- variant v5 at tile_rows=512, dense_frac=0.60 -- runs 34.47 ms/frame against the incumbent candidate hybrid's 47.29, and passes the three-conjunct bit gate on all 8 real frames.",
+      "evidence": "job 34316936: 'KLAB SUMMARY variant=v5 tile_rows=512 dense_frac=0.6 mean_ms=34.47 median_ms=34.01 gate=PASS' and 'KLAB SUMMARY variant=v0 tile_rows=128 dense_frac=0.6 mean_ms=47.29 gate=PASS'. Frac-weighted to the harness's own 512-event mix this is about 37.8 ms/event, per the C1 correction."
+    },
+    {
+      "id": "C13",
+      "provenance": "verified",
+      "claim": "The tile-size optimum MOVED for the new kernel: 512 rows beats 128, contradicting both the contract's 'flat across 128-1024' and the planner's prediction that smaller tiles would win.",
+      "evidence": "job 34316936 tile_rows sweep for v5 at dense_frac=0.6: 32->44.96, 64->39.09, 128->37.72, 256->35.08, 512->34.25 ms/frame, with gate=PASS at 32, 64, 256 and 512."
+    },
+    {
+      "id": "C14",
+      "provenance": "verified",
+      "claim": "The real-frame bit gate DOES exercise the bad gain code and stage 2, so the kernel's most delicate lanes are not untested as the planner and skeptic both suspected.",
+      "evidence": "job 34316936 census: 'GBITS TOTAL n_code0=112459503 n_code1=21756669 n_code2=46 n_code3=1510' with code 2 present on every one of the 8 frames (5-6 pixels each)."
+    },
+    {
+      "id": "C15",
+      "provenance": "verified",
+      "claim": "The patched harness is numerically inert: its binned cube is BIT-IDENTICAL to the unmodified harness's, in both the all-finite fast lane and a NaN-poisoned run that forces every event down the slow lane.",
+      "evidence": "_cand2/cube_inertness.log: 'CUBE_INERT bins=4 sums_bitdiff=0 nvalid_diff=0 counts_equal=True n_nan=0/0 PASS=True' over 64 real events across 4 bins, and 'CUBE_INERT_NANLANE bins=4 sums_bitdiff=0 nvalid_diff=0 counts_equal=True n_nan=256565255/256565255 slow_lane_ran=True PASS=True'. Shared harness md5 a29e67e5c453fb5cd31e9184fe0e3f7c unchanged; patched copy cf794d11ba8689ca46cd8bc0581e8f9c. I read this log myself."
+    },
+    {
+      "id": "C16",
+      "provenance": "verified",
+      "claim": "The candidate worktree is numpy-only: zero numba/njit matches under src/, no accelerator imports, no compiled artifacts, and calib output byte-equal to the frozen reference in three independent interpreters including one where numba is genuinely absent.",
+      "evidence": "I ran the greps myself against pscalib_np8x at HEAD db884878bd96690b8a30815af84809cdcd9a75ed, branch cand/calib-numpy-8x, dirty=0: 'grep -rn -i -e numba -e njit src/' -> A_rc=1 (zero matches), import-level accelerator grep -> B_rc=1, no non-.py tracked files under src/ -> D_rc=1. The worker additionally showed calib md5 a04eea1dd16364b89d1011dedd7ec858 == ref_000.npy under psana+numba-present, psana+hard-blocked, and a bare uv python 3.9.24 with numba absent -- that part is inherited."
+    },
+    {
+      "id": "C17",
+      "provenance": "verified",
+      "claim": "A silent-data-loss defect in the new gather was found by the skeptic and fixed before it reached production: t.reshape(-1) without a C_CONTIGUOUS check returns a copy on a non-contiguous view, discarding every gathered pixel with no error.",
+      "evidence": "Skeptic's remote check on numpy 1.26.4: 'noncontig reshape(-1) is a VIEW? False raises? no / write through? o[0,0]= 0.0 -> SILENT DROP'. Fixed in kernel_lab.py by restoring the incumbent's flat_out branch (lines 281-284, 313); the file now has the check in both _gather_fixup_v0 and _gather_fixup_v2."
+    },
+    {
+      "id": "C18",
+      "provenance": "verified",
+      "claim": "The measured prefetch overlap TRANSFERS into the harness: a Ray task declared exactly as the harness declares it (no num_cpus, so the default 1) is NOT pinned to one core -- it keeps full CPU affinity -- so the prefetch thread and the compute thread genuinely run on different cores.",
+      "evidence": "I wrote and ran _cand2/ray_affinity.py myself on sdfiana025 under the psana env: 'DRIVER_BEFORE_RAY affinity=114 omp=1', 'RAY cluster CPUs = 128.0', 'WORKER pid=4179080 affinity=114 omp=1' -- the worker sees 114 cores, not 1. OMP_NUM_THREADS=1 is set by Ray but governs OpenMP libraries, not python threads. A two-thread numpy concurrency check inside the worker gave two_threads_wall/one_thread_wall = 1.629, where 1.0 is free concurrency and 2.0 is full serialisation; the residual is DRAM-bandwidth contention between two deliberately bandwidth-bound threads, which is the worst case for this test and not what the prefetch thread does."
+    },
+    {
+      "id": "C19",
+      "provenance": "inherited",
+      "claim": "The batched float64 accumulate (H5) exists as an INSERTION-ONLY second patch level and is proved numerically inert at K=1, 4 and 64 across five phases including interleaved bins and a mixed fast/slow-lane phase, so it can be measured without re-proving anything about level 1.",
+      "evidence": "Worker 'worker:batched-accumulate-contingency' reports _cand2/bench_cube_calib_fast2.py md5 1558f52bcf9f6745233b14c48d66cf9b generated with 'LEVEL2_DIFF added_lines=232 removed_lines=0 insertion_only=True', the level-1 file re-derived and byte-compared unchanged at cf794d11ba8689ca46cd8bc0581e8f9c, and 15 CUBE_INERT2 lines all 'sums_bitdiff=0 nvalid_diff=0 counts_equal=True PASS=True' over phases real / nanlane / mixlane / interleave / interleave_nan. The mixlane phase's 'nvalid_range=23..58' inside one bin shows the lazy-nvalid partial+scalar merge was actually reached under batching. NOT re-verified by me -- I have not yet read cube_inertness2.log myself."
+    },
+    {
+      "id": "C20",
+      "provenance": "verified",
+      "claim": "The chosen kernel is LANDED in production: pscalib_np8x commit ce3746332afc6a9dba6ec68f1b29570966fcdb06 on branch cand/calib-numpy-8x, clean, with TILE_ROWS defaulting to 512 and DENSE_FRAC to 0.60, and still zero numba/njit matches under src/.",
+      "evidence": "I ran the checks myself: 'ce37463 perf(calib): fold the mask into the gain, fuse the subtract, one pass per tile', full SHA ce3746332afc6a9dba6ec68f1b29570966fcdb06, dirty=0, src md5 dfabb28d6d5039f8b47d509b1656a863, 'grep -rn -i -e numba -e njit src/' -> grep_rc=1, and _fastcalib.py lines 158/184 showing TILE_ROWS default 512 and DENSE_FRAC default 0.60. git show --stat: 3 files changed, 664 insertions, 68 deletions."
+    },
+    {
+      "id": "C21",
+      "provenance": "verified",
+      "claim": "The psana oracle test was EXTENDED, not weakened, by the kernel port: the diff to tests/test_calib_us000.py is purely additive and both byte-exactness assertions against det.raw.calib and det.raw.image survive verbatim.",
+      "evidence": "I ran 'git diff --numstat tests/test_calib_us000.py' -> '368 0' (368 insertions, ZERO deletions) and 'git diff -U0 ... | grep -c ^-[^-]' -> 0 removed lines, with the assertions still present at lines 188-197: np.array_equal(my_calib, gt_calib) and np.array_equal(my_image, gt_image)."
+    },
+    {
+      "id": "C22",
+      "provenance": "inherited",
+      "claim": "The mask fold has a failure mode I did not anticipate and the landed guard rejects it: a mask value of NEGATIVE zero breaks the bad-gain-code lane, because that lane's factor is a literal 0.0 rather than the folded gain, so dropping its mask multiply flips the sign of the resulting zero. My own guard would have admitted it, since -0.0 satisfies both min()>=0 and array_equal against +0.0.",
+      "evidence": "Worker 'worker:land-v5' test output in _cand2/smoke_new_tests.log: \"mask with a -0.0 on a BAD-code pixel (fold declined) ... fold_reason='mask carries a negative zero; -0.0 breaks the BAD-code lane of the fold'\" and \"bad-code pixel (0,132,310) renders -0.0 through the unfolded fallback, signbit preserved\". The landed guard's success string reads 'mask in {+0.0, 1}'. I have read the log line but have not re-run the test myself."
+    },
+    {
+      "id": "C23",
+      "provenance": "verified",
+      "claim": "The landed kernel is byte-exact against the psana oracle: max|diff| = 0.0 and array_equal True against BOTH det.raw.calib(evt) and det.raw.image(evt) on the reference jungfrau dataset, and the worktree's full 23-test acceptance suite passes with zero skips.",
+      "evidence": "I read these lines myself from _cand2/runtests_v5.log: line 45 '[byte-exact] calib (32, 512, 1024) float32 max|diff|=0.0 array_equal=True', line 46 '[byte-exact] image (4216, 4432) float32 max|diff|=0.0 array_equal=True', plus '23 passed, 0 failed, 0 skipped (of 23 test file(s))', 'RESULT: PASS' and 'RUN_TESTS_EXIT=0'. CAVEAT I am recording rather than hiding: this run executed against the WORKING TREE moments before it was committed as ce37463, so the bytes are identical to the commit but the run does not itself cite the SHA. It will be re-run against ce37463 (or the final SHA) after the proof job, when dirtying the tree can no longer destroy a running measurement."
+    },
+    {
+      "id": "C24",
+      "provenance": "verified",
+      "claim": "The proof instrument WORKS end to end, including the fifth arm and conservative ratios I added: an 8-event smoke ran all five arms, all VERDICT=PASS with partition_invariant=1, and printed every ratio self-consistently. Its rc=90 means only 'target not met at 8 events', which carries no information because roughly 1 s of fixed per-arm cost dominates at that size.",
+      "evidence": "Job 34323653 on sdfmilan241, file _cand2/proof-p4smoke-34323653.out, which I read myself. ARM_ROW lines for before_orig/after_orig/after_fast/before_again/after_fast2 all verdict=PASS p_inv=1; 'RATIO_PRODUCT_CHECK pscalib x harness = 4.1053 vs RATIO_MAIN 4.1053'; 'CACHE_CONTROL before_again/before_orig = 1.0752 in_band(0.90..1.10)=True'; 'BYTES_SYMMETRY workers=1 max/min=1.012 OK'; and my own additions 'RATIO_MAIN2', 'RATIO_BATCH' and two 'RATIO_CONSERVATIVE' lines all present and computed."
+    },
+    {
+      "id": "C25",
+      "provenance": "inferred",
+      "claim": "The harness patch roughly halves the accumulate column in situ. The correct attribution is narrower than 'halves the accumulate': about 6 ms of that column is the finiteness test, which is identical in both arms, so the delta is specifically np.where (151 MB/event) plus the eager nvalid update (151 MB/event) being deleted.",
+      "evidence": "Job 34323653 INSITU lines I read myself. Patched harness, nbins=10: accum_ms 19.783 / 21.132 / 21.587; at nbins=1: 16.023. Unmodified harness, nbins=10: accum_ms 42.691 / 41.858 / 43.442; at nbins=1: 40.711. Same node, same events, same process."
+    },
+    {
+      "id": "C26",
+      "provenance": "verified",
+      "claim": "The prefetch mechanism demonstrably moves the read off the main thread, and the near-zero overlap fraction in the smoke is a one-batch artefact rather than a failure.",
+      "evidence": "Job 34323653 INSITU_DETAIL: patched harness shows 'read_on_main_ms=0.000 qwait_ms=13.941 n_batches=1 overlap_f_ceiling=0.0000', versus the unmodified harness's 'read_on_main_ms=14.081 qwait_ms=0.000'. With 8 events and SUBBATCH=16 there is exactly ONE batch, so the overlap ceiling is structurally zero; the 512-event run has 32 batches."
+    },
+    {
+      "id": "C27",
+      "provenance": "verified",
+      "claim": "THE HEADLINE. Job 34324141 on exclusive node sdfmilan255, 512 events, five arms, all VERDICT=PASS: after_fast runs at 76.864 ms/event at workers=1, meeting the contract's ABSOLUTE 80.7 ms/event ceiling directly. RATIO_MAIN before_orig/after_fast = 11.6161 with target_met=True and rc=0, but that ratio is INFLATED and is not the number I publish.",
+      "evidence": "I read these lines myself from _cand2/proof-cubeproof4-34324141.out: 'ARM_ROW arm=after_fast workers=1 wall=39.35 evt_per_s=13.0100 ms_per_event=76.864', 'RATIO_MAIN before_orig/after_fast = 11.6161 (threshold >= 8.0) [ms_per_event 892.86 -> 76.86]', 'RATIO_PSCALIB after_orig/before_orig = 7.6875', 'RATIO_HARNESS after_fast/after_orig = 1.5110', 'RATIO_PRODUCT_CHECK pscalib x harness = 11.6161 vs RATIO_MAIN 11.6161', 'PROOF_VERDICT ... target_met=True ... rc=0'."
+    },
+    {
+      "id": "C28",
+      "provenance": "verified",
+      "claim": "The published ratio is 8.40-8.56x, NOT 11.62x, because the fourth arm added to detect page-cache contamination found 1.357x of it. Both corrections still clear the threshold: 8.395x against the frozen 645.3 baseline and 8.5592x against the conservative in-job baseline.",
+      "evidence": "Same job: 'CACHE_CONTROL before_again/before_orig = 1.3571 [evt_per_s 1.120 -> 1.520] in_band(0.90..1.10)=False' with the CACHE_CONTROL_FLAG text, and 'RATIO_CONSERVATIVE min(before_orig,before_again)/after_fast = 8.5592'. The frozen-baseline figure 645.3/76.864 = 8.395 I computed myself. before_again at 657.9 ms/event is far closer to the July 645.3 than before_orig's 892.9, which is what a cold first arm looks like."
+    },
+    {
+      "id": "C29",
+      "provenance": "verified",
+      "claim": "The batched float64 accumulate is a measured LOSS and is NOT adopted: 0.9523x at workers=1 and 0.53x at workers=16. Running it as an optional fifth arm rather than holding it as a contingency is what turned a guess into a rejection without costing a second job.",
+      "evidence": "Same job: 'RATIO_BATCH after_fast2/after_fast = 0.9523 [evt_per_s 13.010 -> 12.390]', and the workers=16 rows 'after_fast workers=16 ms_per_event=26.008' versus 'after_fast2 workers=16 ms_per_event=49.213'."
+    },
+    {
+      "id": "C30",
+      "provenance": "verified",
+      "claim": "Byte-exactness, purity, partition invariance and cube bit-identity all hold in the proof job itself.",
+      "evidence": "Same job: 5 'GATE PASS' lines and 0 'GATE FAIL'; 5 'PURITY=PASS'; 20 of 20 ARM_ROW rows carry partition_invariant=1 and 0 carry =0; 10 'BITGATE OVERALL maxabsdiff=0 PASS=True' across numba-active and numba-blocked modes with 0 failures; 'BYTES_SYMMETRY workers=1 max/min=1.014 OK'. Cube bit-identity between the patched and unmodified harnesses over the same events, both accumulators compared byte for byte: 'INSITU_CUBE cmp=orig_vs_fast sums_bitdiffs=0 nvalid_diffs=0 max_abs_sum_diff=0 BIT_IDENTICAL=True' and the same for orig_vs_fast2."
+    },
+    {
+      "id": "C31",
+      "provenance": "inferred",
+      "claim": "The patch cuts the in-situ accumulate column from 41.70 to 14.98 ms/event at n=512 and the prefetch reaches overlap_f=0.9692. QUALIFIED after the fact: the 'accum' column is a RESIDUAL, not an independent measurement, and the multi-bin penalty figure is weakly supported. Neither qualification touches the headline, which rests on the arm RESULT lines rather than on this decomposition.",
+      "evidence": "Job 34324141 step-5 INSITU at n=512: patched 'read_ms=9.102 stack_ms=6.980 calib_ms=40.242 accum_ms=14.977 total_ms=62.480 overlap_f=0.9692'; unmodified-harness 'accum_ms=41.700 total_ms=99.937 overlap_f=0.0000'. QUALIFICATIONS from the post-hoc skeptic, which I verified arithmetically myself: (1) insitu_probe.py:275 computes accum = tot - read_main - qwait - stack - calib, so it absorbs the finiteness test (~6 ms, present in BOTH arms), the python loop and page faults; (2) at n=512 the four printed columns do NOT sum to the printed total -- 71.301 vs 62.480 patched and 99.936 vs 99.937 unmodified -- because read_ms is the prefetch thread's time while the subtraction uses qwait, and the two diverge once there is more than one batch, so the patched columns over-count by 8.8 ms and must not be added; (3) the nbins=10 vs nbins=1 comparison is ONE unreplicated run per harness and the two arms disagree by 2.5x about a cost they must share; (4) the same probe on the login node swung accum 14.3 -> 50.0 ms across identical passes. The decomposition is indicative of MECHANISM, not a stable measurement."
+    },
+    {
+      "id": "C32",
+      "provenance": "verified",
+      "claim": "Numpy alone suffices, proved at the landed SHA with every accelerator hard-blocked at import.",
+      "evidence": "I ran this myself at ce37463: 'grep -rn -i -e numba -e njit src/' -> grep_rc=1 (zero matches); dependencies = [\"numpy\", \"psdata\"] and psdata's own dependencies = [\"numpy\"]; with numba/llvmlite/numexpr/cython/pythran all blocked by a meta_path finder, 'IMPORT numba -> ModuleNotFoundError: BLOCKED: numba', then BACKEND {\"compiled_extensions\": [], \"compute_backend\": \"numpy\", \"kernel\": \"numpy_hybrid\", \"tile_rows\": 512, \"dense_frac\": 0.6}, then 'CALIB_OK shape=(32, 512, 1024) dtype=float32 bitdiff=0 signzerodiff=0 maxabsdiff=0.0 nanmask_equal=True' and 'ACCEL_IN_SYS_MODULES []'."
+    },
+    {
+      "id": "C33",
+      "provenance": "inherited",
+      "claim": "An auto-void rule survived in the driver that the file's own header claimed had been removed: BYTES_SYMMETRY still carried fail=97 above a 1.50 spread. It did not fire (measured 1.014), so the result stands, but that is luck confirmed after the fact rather than design.",
+      "evidence": "Reported by worker 'worker:four-arm-proof', which found 'fail = 97' at proof4arm.sbatch line 572 and removed it post-run (new md5 24c5f09de54daa0cacb09b28bb9b9cfa, pre-edit backed up as proof4arm.sbatch.bak-ef365b59). The version Slurm actually staged and ran was ef365b59589230b8ed9dad91cb00abf0. I have not re-read the file myself."
+    },
+    {
+      "id": "C34",
+      "provenance": "inherited",
+      "claim": "An independent reconstruction of the smoke's fixed per-arm cost, done blind of the real job, lands at 8.40-8.61x -- bracketing the 8.56x the 512-event job then measured. My earlier '~9.8x' extrapolation from the smoke was wrong because it compared a compute-node numerator against a LOGIN-NODE denominator.",
+      "evidence": "Post-hoc skeptic, iteration 4: deriving F per arm from the smoke's own steady states gives F=872 ms (fast) and F=996 ms (orig), a 124 ms spread with no mechanism, and applying either to either incumbent arm yields 7.70/7.91/8.40/8.61 -- never 9.8. It also computes dR/dF ~ 13-21 ratio units per second of F, so the smoke extrapolation was never precise enough to quote. The real job's directly measured conservative 8.5592x sits inside that band. I verified the column-sum arithmetic myself; I did not re-derive F."
+    },
+    {
+      "id": "C35",
+      "provenance": "verified",
+      "claim": "ATTRIBUTION CORRECTION. The 7.69x I published for pscalib's own contribution uses the CONTAMINATED cold baseline. On the conservative warm baseline the split is pscalib 5.66x times harness patch 1.511x = 8.559x. So pscalib's src/ -- the part that ships -- is worth 5.66x, and the remaining 1.51x comes from a benchmark-harness rewrite that ships to nobody.",
+      "evidence": "Computed by me from job 34324141's own evt_per_s figures: after_orig 8.61 / before_again 1.52 = 5.664; after_fast 13.01 / after_orig 8.61 = 1.511; product 8.559, which matches the job's printed RATIO_CONSERVATIVE of 8.5592 exactly. The blind skeptic's pre-registered condition V11 anticipated this split precisely ('if the 512-event split is, say, 6.5 x 1.25, the honest headline is 6.5x from pscalib, not 8.1x from numpy alone under src/')."
+    },
+    {
+      "id": "C36",
+      "provenance": "inherited",
+      "claim": "COLD READER VERDICT: NOT usable from the artifacts alone. Every CORRECTNESS claim survives contact -- it reproduced the numpy-only and byte-exactness claims itself from the tree -- but the headline does not. The single blocking defect is that the arms run cold-then-warm and the job never re-takes the measurement: it exits rc=0 with target_met=True on the inflated 11.62x while printing 'must be re-taken before it is published'.",
+      "evidence": "Cold-reader report, iteration 4. It also found: the 645.3 ms/event baseline is an INHERITED model anchor from _cand/impl/timing.json ('anchored_total_ms': 645.3), never measured in this campaign; H7_SPEC.md is the only prose document in a 115-entry directory and specifies work that was never built, projecting 7.7x and thus telling a stranger the target is unreachable; a CANCELLED job's output sits unlabelled beside the valid ones; two near-identical drivers exist and only scontrol reveals which ran; and after_fast2 at 80.71 ms/event misses the 80.7 target by 0.01 ms. Its three priority fixes: re-take the timing with interleaved arms or dropped caches and make cache_control_ok=False a hard non-zero exit; write a one-page CLAIM.md; and emit a per-bin cube digest so the real 512-event arms compare cube-to-cube."
+    }
+  ]
+}

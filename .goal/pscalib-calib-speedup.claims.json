@@ -1,0 +1,144 @@
+{
+  "goal": "Reduce pscalib's jungfrau calibration cost by at least 5x, measured as the paired after/before evt_per_s ratio at workers=1 in bench_cube_calib.py, while holding byte-exactness against the pure-numpy reference, purity of that reference path, and partition invariance.",
+  "slug": "pscalib-calib-speedup",
+  "claims": [
+    {
+      "id": "C1-incumbent",
+      "provenance": "verified",
+      "evidence": "I printed both arms' RESULT lines from job 31397423 on node sdfmilan053 (order=ba): CUBE_ARM=before (pscalib 6a9573da) workers=1 evt_per_s=1.52, workers=16 evt_per_s=9.12; CUBE_ARM=after (pscalib c5ce538) workers=1 evt_per_s=1.55, workers=16 evt_per_s=10.58. Both arms show GATE PASS, 'PURITY=PASS (32, 512, 1024) float32', partition_invariant=1, VERDICT=PASS.",
+      "claim": "The incumbent to beat is live pscalib c5ce538 at workers=1 evt_per_s=1.55, i.e. 645 ms/event. The 5.0x target is therefore 7.75 evt/s = 129 ms/event."
+    },
+    {
+      "id": "C2-read-cost",
+      "provenance": "verified",
+      "evidence": "I printed from profile-prof-r1-ba-31397496.out: 'PROFILE end=before det=jungfrau K=1000 total_s=38.72 pread_s=29.02 (74.9%) decode_s=2.01 (5.2%) numpy_s=7.46 (19.3%)'. Independently, I read bench_cube_calib.py around line 672 and confirmed the per-worker loop is strictly serial (ridx.read_events(sub) -> evt.stack(det) -> pscalib.calib(...) -> binning) with NO prefetch or pipelining.",
+      "claim": "psdata read+stack costs 38.7 ms/event and ADDS to calib rather than overlapping it, because the harness worker loop is serial."
+    },
+    {
+      "id": "C3-irreducible-post-and-ceiling",
+      "provenance": "verified",
+      "evidence": "My own run: script /sdf/data/lcls/ds/prj/prjcwang31/results/_cand_books.py, output _cand_books.out on sdfiana025, numpy 1.26.4, production shapes. Printed: 'isfinite+where+f64 accum+nvalid n=3 median=39.9 ms minflt/call=17300' and '=> CEILING on end-to-end speedup = 8.17x'.",
+      "claim": "The harness's own post-calib per-event work (np.isfinite, np.where, float64 += accumulate, uint32 nvalid +=) costs 39.9 ms/event and is OUTSIDE pscalib, hence irreducible by this campaign. With read 38.7 ms the irreducible floor is 79.0 ms/event, so the end-to-end ceiling is 8.17x and calib must fall to <= 50 ms/event to clear 5.0x. This FALSIFIED my pre-registered prediction (f) of 60-90 ms, in the favourable direction."
+    },
+    {
+      "id": "C4-where-the-time-goes",
+      "provenance": "verified",
+      "evidence": "My own runs _cand_books.out and _cand_mine3.out. Printed: 'plugin_jungfrau (mask rebuilt) median=560.6 ms', 'mask_from_pixel_status alone median=293.4 ms', 'calib_jungfrau w/ mask given median=264.6 ms', 'BOOKS: mask 293.4 + core 264.6 = 558.0 vs full 560.6 (residual 2.6 ms)'. On the REAL fixture: 'reference plugin (mask rebuilt per event): median 602.7 ms over 3 frames'.",
+      "claim": "Today's pscalib.calib costs 560-603 ms/event, of which mask_from_pixel_status is 293.4 ms (52%) rebuilt on EVERY event because the dataset supplies no cached mask. The books balance to 0.5% residual, so the split is trustworthy."
+    },
+    {
+      "id": "C5-real-gain-distribution",
+      "provenance": "verified",
+      "evidence": "My own run _cand_mine3.out computed the non-G0 fraction directly from the fixture raw frames and printed per frame: 0.1667, 0.0834, 0.6424, 0.0052, 0.2460, 0.0000, 0.0000, 0.1531. This independently reproduces the histogram in the fixture's STATS.txt, which I also printed: gbits==0 fraction 0.8378885910, gbits==1 0.1620998159, gbits==2 (BAD code) 0.0000003427, gbits==3 (stage 2) 0.0000112504.",
+      "claim": "Real jungfrau r51 data is ~83.8% gain stage 0 and ~16.2% gain stage 1, with stage 2 at 0.0011% and the bad code at 0.0000003%. Per-frame non-G0 swings from 0.001% to 64.2%. So only stages 0 and 1 matter in bulk, and any design whose cost scales with the non-G0 fraction is exposed to a 64% worst-case frame."
+    },
+    {
+      "id": "C6-candidate-byte-exact",
+      "provenance": "verified",
+      "evidence": "My own run _cand_mine3.out against the real fixture (real constants + 8 real frames + 8 frozen ref_NNN.npy outputs of today's pscalib): all 8 frames at tile sizes 512/256/128 printed 'PASS=True bitdiffs=0 signzerodiffs=0 maxabs=0', and the summary line 'ALL FRAMES, ALL TILE SIZES, BYTE-EXACT: True'. Mask derivation: 'mask bit-identical to reference derivation: True'.",
+      "claim": "My candidate (hoisted mask/poff/gfac + tiled two-plane blend + sparse fixup for stage 2 and the bad code) is byte-exact against the frozen output of today's pscalib on real frames: 0 differing bit patterns, 0 sign-of-zero disagreements, max|diff| exactly 0."
+    },
+    {
+      "id": "C7-the-gate-bites",
+      "provenance": "verified",
+      "evidence": "My own runs _cand_mine2.out and _cand_mine3.out. On adversarial data: mutation 'where' (masked pixels written as literal +0.0) -> CAUGHT, 159366 bit diffs and 85566 sign-of-zero diffs; mutation 'f64' (sparse chain computed in float64, single rounding) -> CAUGHT, 100546 bit diffs; control 'nomaskskip' -> PASS(correct). On real data: 'masked->+0.0 -> CAUGHT=True (bitdiffs=221 signzerodiffs=221)', exactly matching the 221 negative zeros the reference emits in that frame.",
+      "claim": "The three-conjunct bit gate (identical NaN masks; uint32 bit equality on the non-NaN set; signbit equality wherever the value is zero) CAN fail and does fail on both realistic mutations, so a PASS from it is evidence. A plain max|diff|==0 gate would have missed the -0.0 mutation. Corollary: my first mutation attempt (bad-code -> literal 0.0) did NOT bite, because the bad code computes (adc-0.0)*0.0 with adc a non-negative 14-bit integer, so the reference itself emits +0.0 there; the -0.0 population comes from MASKED pixels, not bad-code pixels."
+    },
+    {
+      "id": "C8-128-event-metric-unusable",
+      "provenance": "verified",
+      "evidence": "I printed both arms' RESULT lines from null job 34292691 on sdfmilan256, where BOTH arms ran bit-identical c5ce538 code: CUBE_ARM=before wall=500.88s evt_per_s=0.26 MB_per_s=9; CUBE_ARM=after wall=114.11s evt_per_s=1.12 MB_per_s=40. Ratio 4.31x on identical code. The order=ab control (job 34293931, sdfmilan252) gave arm1 after=1.48, arm2 before=1.11, ratio 1.33x -- opposite sign.",
+      "claim": "The paired A/B design is NOT self-normalizing at BENCH_EVENTS=128: identical code yields ratios of 4.31x and 1.33x depending on arm order, driven by page-cache warming (MB_per_s 9 -> 40). Therefore no number from a 128-event run may be quoted, and the final proof must use 512 events, matching the configuration the incumbent baseline was measured at."
+    },
+    {
+      "id": "C15-metric-void-at-512-too",
+      "provenance": "verified",
+      "evidence": "I printed both arms' RESULT lines from null job 34293932 on node sdfmilan225, order=ba, events=512, where BOTH arms ran bit-identical c5ce538 code: 'CUBE_ARM=before ... wall=1882.03s evt_per_s=0.27 ... MB_per_s=10 partition_invariant=1 VERDICT=PASS' and 'CUBE_ARM=after ... wall=345.02s evt_per_s=1.48 ... MB_per_s=53 partition_invariant=1 VERDICT=PASS', followed by 'cube-candidate done rc=0'. Ratio after/before = 1.48/0.27 = 5.48x.",
+      "claim": "SUPERSEDED AS TO ITS DIAGNOSIS, RETAINED AS TO ITS ALARM. The 5.48x null was real, but my inference that the cluster had degraded and that pre-warming was the fix was REFUTED by skeptic:iteration-1, which re-ran the same script on a fresh exclusive node 75 min later and got cold read 59.27 ms/event at 602 MB/s (not 3264 ms/event at 12 MB/s), and showed via sacct that the slow arms coincided with a SELF-INFLICTED I/O storm from my own three concurrent xtc-reading jobs (34293074/34293421/null128 all overlapping 16:46-17:07). Pre-warm was independently falsified by its 0.83x null, where the SECOND arm was slower despite a warm cache. The correct remedy, adopted, was a reject rule plus strict serialisation of my own jobs. See C16 for the validated noise floor."
+    },
+    {
+      "id": "C9-candidate-speed-short-of-target",
+      "provenance": "verified",
+      "evidence": "My own run _cand_mine3.out, mean over the 8 real fixture frames: tile=128 calib=68.02 ms/event, tile=256 69.20, tile=512 70.89, tile=1024 70.29; per-frame at tile=128: 89 70 96 53 90 36 36 76 ms. Summary line: 'BEST tile=128 calib=68.02 ms/event => total 147.0 ms => 4.39x'.",
+      "claim": "SUPERSEDED. This described the pure-numpy-only candidate at 68 ms/event = 4.39x. The landed candidate adds a fused numba backend which cuts the per-frac slope 3.9x; see C17 and C18 for the final measured result. The pure-numpy fallback remains below the bar on its own (~4.4-4.8x), which is why the numba backend is load-bearing rather than decorative."
+    },
+    {
+      "id": "C10-fused-pass-needed",
+      "provenance": "inferred",
+      "evidence": "Reasoning from C9 plus measured bandwidth: the two-plane blend's DRAM floor is raw 33.5 + poff[0] 67 + poff[1] 67 + gfac[0] 67 + gfac[1] 67 + out 67 = 368 MB/event, which at the 17 GB/s the reference itself demonstrates (8.8 GB / 514 ms) is ~22 ms. Measured blend-tile cost is ~90 ms, i.e. 4x off that floor, and the gap is L1/L2 traffic from ~7 numpy passes per tile rather than DRAM. numba 0.60.0 is available (C11).",
+      "claim": "Closing the remaining gap from 68 ms to <= 50 ms requires collapsing the per-tile pass count, which a single fused kernel does by construction. This is the contract's move (5). It must be an OPTIONAL backend with the pure-numpy path kept importable with numpy alone. NOT YET MEASURED -- this is a design inference, not a result."
+    },
+    {
+      "id": "C11-numba-available",
+      "provenance": "verified",
+      "evidence": "My own check in the exact psana release env used by the sbatch (source /sdf/group/lcls/ds/ana/sw/conda2/manage/bin/psconda.sh): printed 'python 3.9.20', 'numpy 1.26.4', 'NUMBA 0.60.0', 'llvmlite 0.43.0', CONDA_PREFIX /sdf/group/lcls/ds/ana/sw/conda2/inst/envs/ps_20241122.",
+      "claim": "numba 0.60.0 and llvmlite 0.43.0 are already importable in the psana release environment the measured runs use, so an optional Numba backend can fire in the measured run without touching the psana release. Candidate code must remain python-3.9 compatible."
+    },
+    {
+      "id": "C12-real-constants-are-benign",
+      "provenance": "verified",
+      "evidence": "Printed from the fixture STATS.txt: pedestals g=0/1/2 nan=0 inf=0, negative=0; pixel_gain nan=0 inf=0 exact_zero=0, with g=1 and g=2 entirely negative (g=1 min -2.45 max -0.40); pixel_offset g=0 exact_zero=16777216 (identically zero) while g=1/g=2 are nonzero. Corroborated by my own run _cand_mine3.out, which reported nan=0 and maxabs=0 on every real frame.",
+      "claim": "The real constants contain no NaN and no inf, so on real frames the contract's max|diff|==0 gate is well-defined and clean. pixel_offset[0] is identically zero (so poff[0] == pedestals[0] exactly), and pixel_gain for stages 1 and 2 is entirely negative, which is what makes the -0.0 population real rather than hypothetical."
+    },
+    {
+      "id": "C13-independent-kernel-worker-corroboration",
+      "provenance": "inherited",
+      "evidence": "Report of the workflow agent labelled 'tiled-numpy-kernel' (worker 3 of iteration 1), via its progress file /sdf/.../_cand/kernel/KERNEL_PROGRESS.txt which I printed: reference copied verbatim (md5 9196fee8b7a9bc4dc6f3e468be72ac19 for jungfrau.py, diff empty); adversarial fixture whose reference output contains -0.0 x234146, NaN x219373, +inf x138351, -inf x85834; 'GATE FIRST RUN: OVERALL PASS, n_checks=33 n_fail=0'; 'np.select(float32 choices, default=0).dtype == float32 in numpy 1.26.4'; 'SEGMENTED mask == WHOLE-ARRAY mask byte-for-byte (n_diff=0)'; 'tile_rows in {0,512,256,128,64,32,16,7,1} all PASS'; 'np.empty == np.zeros output'; 'memo over 5 events miss=3 hit=12 stale=0'; 'ZERO fix rounds needed'.",
+      "claim": "A second, independently written implementation and gate agree with mine on every shared conclusion, including that numpy 1.26.4's np.select over float32 choices with an integer default stays float32 (so the reference arithmetic is pure single precision), and that the segmented mask derivation is byte-for-byte identical to the whole-array one. INHERITED: I have printed this agent's progress artifact but have not re-run its gate myself; my own independent gate (C6, C7) is the verified one."
+    },
+    {
+      "id": "C14-guardrails-held",
+      "provenance": "verified",
+      "evidence": "My own run: 'git -C .../software/pscalib status --porcelain' printed exactly the two pre-existing untracked entries I had recorded before any delegation ('?? .preexisting_bak/', '?? stress/discover_dets.py'); 'git rev-parse HEAD' printed c5ce538981c62b975d0d5e672070c7ec6afe0fb5; '_before_worktrees/pscalib_before' still at 6a9573da429187af113b7b025802c1e007358b76; 'git worktree list' shows the two NEW worktrees _cand_worktrees/pscalib_cand (c5ce538, branch cand/calib-speedup) and _cand_worktrees/pscalib_incumbent (c5ce538, detached); the candidate branch's diff vs c5ce538 is empty.",
+      "claim": "No guardrail has been violated: the live pscalib tree is unmodified, _before_worktrees is untouched, all campaign writes are inside the prjcwang31 project space, and work is confined to a new candidate git worktree which as of iteration 1 still carries zero changes."
+    },
+    {
+      "id": "C16-noise-floor-and-a-broken-reject-rule",
+      "provenance": "verified",
+      "evidence": "I printed both arms of clean null job 34300682 (sdfmilan231), where both arms were verified byte-identical (ARMS_IDENTICAL_CHECK before_src_md5=67ba82621a4ca3f65762bec5a909f671 == after_src_md5, LIB_PSCALIB_POSTARM sha=c5ce538 dirty=0 for both): workers=1 before evt_per_s=1.48 MB_per_s=53 vs after evt_per_s=1.60 MB_per_s=58, 'RATIO workers=1 after_over_before evt_per_s=1.0811', 'IOSYM workers=1 ... asymmetry=0.0862 ... verdict=OK'; workers=16 before 3.74 (134 MB/s) vs after 4.89 (176 MB/s), RATIO 1.3075, asymmetry 23.9% => 'VOID: arm I/O asymmetry' and rc=96.",
+      "claim": "With symmetric I/O the workers=1 arm-position noise floor is +8.1% (second arm favoured), not the 5.48x pathology, so the instrument is usable at workers=1 once competing jobs are excluded. workers=16 is currently I/O-limited (a clean incumbent arm gets 3.74 evt/s against July's 9.12) and is reported for the record only, as the contract specifies. SEPARATELY, I found that the MB_per_s reject rule is a CATEGORY ERROR when applied to a real A/B comparison rather than a null: MB_per_s is just 33.5 MB x evt_per_s (41 ~= 33.5*1.13, 311 ~= 33.5*8.67), so a genuine speedup NECESSARILY makes the arms' throughput differ by the speedup factor. All three proof jobs were therefore VOIDed by a rule that cannot distinguish a real speedup from I/O asymmetry. The correct symmetry check is equal BYTES READ per arm, which the runner verified independently (18267/18416/18384/18378 MB across arms). The VOID verdicts are an artifact of a null-calibrated rule, not evidence against the result. CONFIRMED BY skeptic:iteration-3 from the source: bench_cube_calib.py:1136-1147 computes mbs = nbytes/1e6/wall where nbytes is fixed by the event count, and ab_verdict.py:80 tests abs(a-b)/larger against 0.15 -- so the rule degenerates to a WALL-TIME symmetry test and ANY real speedup above ~1.18x voids. It can never pass for a proof run, and its firing therefore carries zero contention information. All three proof jobs exited rc=96 for this reason, with every arm itself exiting rc=0. The skeptic also corrected one of the runner's supporting arguments as tautological (MB_per_s x wall == nbytes by construction) and one as wrong (the incumbent's 41-42 MB/s is BELOW its own historical compute-bound rate of 54-56 MB/s, so 'compute-bound' does not explain jobs A and C)."
+    },
+    {
+      "id": "C17-the-paired-proof",
+      "provenance": "verified",
+      "evidence": "I printed the RESULT lines of all three paired jobs myself. Job 34306602 (sdfmilan244, order=ab): 'CUBE_ARM=after ... LIB_PSCALIB_SHA_ASSERTED: 5c432ecd2df495c008a63d99500a07a4542ca142 (candidate, EXP_CAND_SHA)' with 'workers=1 wall=61.90s evt_per_s=8.27 MB_per_s=297 partition_invariant=1 VERDICT=PASS'; 'CUBE_ARM=before ... LIB_PSCALIB_SHA_ASSERTED: c5ce538981c62b975d0d5e672070c7ec6afe0fb5 (incumbent)' with 'workers=1 wall=338.28s evt_per_s=1.51 MB_per_s=54 partition_invariant=1 VERDICT=PASS'; 'RATIO workers=1 after_over_before evt_per_s=5.4768'. Job 34305979 (sdfmilan235, order=ba): candidate 8.67 evt/s vs incumbent 1.13 evt/s (41 MB/s) => 7.6726. Job 34307736 (sdfmilan252, order=ab replicate): candidate 7.63 vs incumbent 1.17 (42 MB/s) => 6.5214. workers=16 for the record: {5.6510, 1.5918, 2.0388}.",
+      "claim": "REFINED BY skeptic:iteration-3, which I accept. THE HEADLINE IS ~5.3x-5.5x, NOT 6.48x. Job 34306602 (sdfmilan244, order=ab) satisfies the contract's requirement on its own: candidate 8.27 evt/s vs incumbent 1.51 evt/s = RATIO 5.4768 >= 5.0 at workers=1. It is also the ONLY one of the three jobs whose BOTH arms are consistent with the measured cost model, and it is the conservative ordering (candidate arm ran FIRST and therefore COLD, incumbent second and warm), with its incumbent arm reproducing the July baseline to 2.6% (338.28 s vs 338.08 s). I DISCARD job 34305979's 7.6726x: it exceeds the 7.646x hard ceiling implied by the 84.4 ms/event irreducible floor, i.e. it is faster than deleting calib entirely, so its incumbent arm (882.3 ms/event, +33.6% vs July) was degraded; sacct also reports internally inconsistent CPU totals for that job and its workers=16 candidate wall (22.43 s) is 2.2x off its own two replicates (50.49, 48.74 s). Job 34307736's incumbent was likewise +32.9%. The independent cross-check the skeptic built -- comparing each candidate arm against the POSITION-MATCHED July incumbent (harness file unchanged since 2026-07-11 19:47:17, same psana SHA 7967fd21, same node SKU, same run/det/events/bins/bin-var) -- gives 5.5818x, 5.4617x and 5.0392x, geomean 5.3558x with minimum 5.0392x. That agrees to 1% with the cost model's a-priori prediction 645.3/(84.4+37.36) = 5.300x, and the candidate's absolute cold walls (120.9 and 131.0 ms/event) match the model's 121.76 ms. So the candidate side is corroborated three independent ways and the surviving claim is 5.0x-5.6x, centred near 5.4x."
+    },
+    {
+      "id": "C18-byte-exactness-and-purity-in-the-proof-job",
+      "provenance": "verified",
+      "evidence": "From the same jobs I printed: 'GATE PASS: bin key event-derived /\\ calib real /\\ parallel==serial /\\ zero rescan /\\ import-pure. Clock starts.', '[gate] clean-room purity attest: PURITY=PASS (32, 512, 1024) float32', 'partition_invariant=1' in every arm, and in BOTH arms of every job 'BITGATE OVERALL maxabsdiff=0 PASS=True (arm=<arm> mode=numba_active frames=8 failed=0)' AND the same for 'mode=numba_blocked'. Plus the psana oracle (_oracle_A_numba.log): '[byte-exact] image (4216, 4432) float32 max|diff|=0.0 array_equal=True', '[ok] (b) offline render calib + image byte-exact vs psana (max|diff| == 0)', 'ALL US-000 ACCEPTANCE CHECKS PASSED', 'RESULT: PASS -- 1 passed, 0 failed, 0 skipped', ORACLE_A_RC=0.",
+      "claim": "Byte-exactness and purity held rather than being traded away: max|diff| is exactly 0 against the frozen pure-numpy reference on real frames, in both arms, for BOTH the numba-active and the numba-blocked configuration; GATE PASS, PURITY=PASS and partition_invariant=1 appear in every arm of every job. The psana cross-check is also now closed for the numba backend: pscalib's own test_calib_us000.py passes with max|diff| == 0.0 against psana's det.raw.calib(evt) and against det.raw.image, which the campaign had never previously verified directly. CAVEAT recorded in the same breath: the harness's GATE PASS / PURITY=PASS / partition_invariant lines do NOT themselves test byte-exactness (run_gate never compares calib to a reference, and PURITY=PASS only asserts isfinite(cal).any()), so the load-bearing evidence is the BITGATE lines and the psana oracle, not the harness gate."
+    },
+    {
+      "id": "C19-the-signed-raw-defect-found-and-fixed",
+      "provenance": "verified",
+      "evidence": "skeptic:iteration-2's atk_signed.py reported 24 of 36 checks failing, e.g. '[FAIL] raw=int16 negatives numpy_df0.60 nneg=3341 n_bitdiff=3309 maxabsdiff=32292.61' and '[DISAGREE] raw=int16 negatives numpy-vs-numba n_bitdiff=3273'. I fixed it myself: md5 before my edit was 2bf68d5eda870679bd93e097549fd4f8, matching the md5 the skeptic had recorded, so I edited exactly the file it verified; committed as 5c432ecd2df495c008a63d99500a07a4542ca142. I then re-ran the skeptic's own unmodified script and printed 'ATK1 n_fail=0 of 36 checks', 'ATK1_EXIT 0', with every pair '[AGREE] ... n_bitdiff=0 maxabsdiff=0.0'. No-regression verified by my own run: all 8 real frames byte-exact with backend_used=numba on every frame (not routed to the reference), mean calib 37.36 ms/event.",
+      "claim": "A real byte-exactness defect existed in the candidate and was fixed before the proof job ran. The pure-numpy path classified the gain stage with 'a >= 0x4000', which is False for every negative word, so a negative raw word never entered the residual set nor the gather fixup and silently kept its stage-0 base value (error ~3e4 ADU), whereas the reference computes (arr>>14).astype(np.uint8) = 255 for such a word, which matches none of (0,1,3) and falls to the np.select default lane rendering 0.0; the numba kernel used (v>>14)&0xFF and so DISAGREED with the numpy path. It was latent, not live, because real jungfrau raw is uint16, but it broke the guardrail that the pure-numpy path is the byte-exact fallback, and the gate's own 'int32 raw' robustness check could not have failed because it cast a uint16 fixture slice upward. Non-unsigned raw now defers to the verbatim reference, closing both the exactness gap and the backend disagreement by construction."
+    },
+    {
+      "id": "C20-mechanism",
+      "provenance": "verified",
+      "evidence": "My own measurements: mask_from_pixel_status was 293-296 ms of the 560-603 ms per-event calib cost (45-56%) and was rebuilt on EVERY event because the dataset supplies no cached mask; my fused kernel fits numba_ms = 25.45 + 39.71*frac against the pure-numpy path's 28.3 + 154.2*frac; pure-G0 frames run 18.51 ms which at ~251 MB/event of unavoidable traffic is ~13.6 GB/s, i.e. at the streaming roofline. Landed candidate: mean calib 37.36 ms/event vs the incumbent's 560.9, i.e. ~15x on calib alone. Proof jobs: candidate 8.27 evt/s = 121 ms/event against the 84.4 ms/event irreducible floor.",
+      "claim": "The speedup comes from three things in descending order: hoisting a CONSTANT mask that was being rebuilt 512 times (about half of all calib cost), replacing np.select -- which materialises int64 temporaries and reads every gain plane in full -- with a per-pixel fused pass, and deleting no-op astype copies. After the change the candidate is within ~37 ms of an 84.4 ms/event floor that pscalib cannot touch (psdata read 38.7 + stack 10.4 + the harness's own isfinite/where/float64-accumulate 35.3), so end-to-end gain is now floor-limited rather than calib-limited: this is why 5.5x end-to-end corresponds to ~15x on calib, and why at workers=16 the ratio compresses to 1.6-5.7x as the job becomes I/O-bound."
+    },
+    {
+      "id": "C21-workers16-buys-nothing",
+      "provenance": "verified",
+      "evidence": "I printed the workers=16 RESULT lines from all three jobs: candidate 22.83 / 10.14 / 10.50 evt/s and incumbent 4.04 / 6.37 / 5.15 evt/s, giving raw ratios 5.6510 / 1.5918 / 2.0388. skeptic:iteration-3 position-matched these against the same code's July figures (48.41 s warm / 56.01 s cold, i.e. 10.58 evt/s at workers=16 in job 31397423) and obtained 2.16x (unreplicated), 1.11x and 1.15x, geomean 1.40x. All three iteration-3 incumbent workers=16 arms were 66-126% slower than July.",
+      "claim": "At workers=16 the candidate buys approximately NOTHING. Its two replicated measurements (10.14 and 10.50 evt/s) are statistically indistinguishable from the ESTABLISHED July incumbent baseline of 10.58 evt/s. The raw ratios of 1.59x-5.65x are artifacts of degraded denominators, and the 2.9992 order-paired geomean should not be quoted. The mechanism is that once calib is ~15x cheaper the 16-way job becomes I/O-bound, so the calib saving no longer appears in wall time. The contract prints workers=16 for the record and does not threshold it, which is exactly the right treatment; I am not claiming a workers=16 improvement."
+    },
+    {
+      "id": "C22-psana-bit-exactness-strengthened",
+      "provenance": "verified",
+      "evidence": "I printed both oracle logs: _oracle_A_numba.log and _oracle_B_numpy.log each show '[byte-exact] calib (32, 512, 1024) float32 max|diff|=0.0 array_equal=True', '[byte-exact] image (4216, 4432) float32 max|diff|=0.0 array_equal=True', 'ALL US-000 ACCEPTANCE CHECKS PASSED', 'RESULT: PASS -- 1 passed, 0 failed, 0 skipped', ORACLE_A_RC=0 / ORACLE_B_RC=0. The runner's direct probe printed 'PSANA_ORACLE backend_used=numba frame=0..3 max|diff|=0.0 array_equal=True bitdiffs=0 signzerodiffs=0' and the same for backend_used=numpy.",
+      "claim": "Byte-exactness against psana's own det.raw.calib(evt) is closed for BOTH backends, and it is BIT-exactness rather than merely value-exactness. skeptic:iteration-3 identified that the committed suite uses np.array_equal, which treats -0.0 == +0.0, so the suite alone proves value-exactness; it closed the gap with its own probe that builds constants from psana's det.raw._calibconst (not from the campaign fixture and not from the runner's script) and compares at bit level over 3 events x {auto, numpy, forced numba}: bitdiffs=0, signzerodiffs=0, nanmask_equal=True, and negzero_mine == negzero_psana (221/230/220) in all 9 comparisons. Scope caveat: the psana oracle covers 1 suite event plus 4+3 probe frames per backend, not all 512 benchmark events."
+    },
+    {
+      "id": "C23-the-unexplained-residual",
+      "provenance": "inferred",
+      "evidence": "skeptic:iteration-3 established that harness, psana release, python/numpy/ray versions, node SKU and all benchmark parameters are identical to July, yet two of three iteration-3 incumbent arms ran 33% slower (451.74 s and 438.23 s vs July's 329.77-338.08 s). It found user bjarnek running 14-17 concurrent 120-CPU jobs throughout the window, including on sdfmilan244 and sdfmilan252 minutes before our jobs landed; our nodes were --exclusive (AllocCPUS=120, no co-tenant) so any effect is Weka-side rather than CPU-side. But cluster-wide milano load was the same in both windows (July 28.2-28.7k CPUs vs August 28.5-29.5k), so external load does NOT explain the slowdown.",
+      "claim": "A 33% slowdown of the INCUMBENT arm in two of three jobs is real and UNEXPLAINED. It does not threaten the result -- it inflates ratios, and the surviving 5.0x-5.6x claim is anchored on the one job whose incumbent matched July plus a position-matched comparison against July itself -- but it means the measurement environment was uncontrolled. The honest converse, which I record rather than dismiss: if the JULY baseline were instead the anomaly (unrealistically fast), the in-job paired 6.48x would be right and the 5.36x conservative. Two measurements of c5ce538 (329.77, 338.08 s) against three (338.28, 438.23, 451.74 s) cannot arbitrate that, and settling it needs repeated runs on one node, which nobody has done."
+    }
+  ]
+}
