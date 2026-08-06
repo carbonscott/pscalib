@@ -1,6 +1,17 @@
 """pscalib.apply._fastcalib -- the byte-exact fast machinery behind the apply leaves.
 
-This module holds THREE things, none of which changes a single output bit:
+NUMPY IS THE ONLY BACKEND.  There is no JIT, no ahead-of-time compiler and no
+compiled extension of any kind here -- not even behind a ``try/except`` -- so
+``import pscalib`` needs numpy and the python stdlib and nothing else.  An
+earlier revision of this file carried an OPTIONAL fused JIT kernel; it was
+DELETED for the numpy-only jungfrau cube campaign (branch
+``cand/calib-numpy-8x``), which forbids every compiled accelerator anywhere
+under ``src/``.  ``PSCALIB_CALIB_BACKEND`` therefore accepts ``auto``, ``numpy``
+and ``reference``; ANY other value raises ``ValueError`` naming the value asked
+for, and never falls back silently, because a silent fallback would mislabel a
+measurement.
+
+This module holds TWO things, neither of which changes a single output bit:
 
 1. **The memo (the hoist).**  ``poff = pedestals + pixel_offset``,
    ``gfac = 1/pixel_gain`` and the default status mask are pure functions of the
@@ -47,14 +58,6 @@ This module holds THREE things, none of which changes a single output bit:
    roundings.  The path choice depends only on the frame's own contents, so it is
    invariant under any event partition; blocking is over SPATIAL axes only.
 
-3. **The OPTIONAL fused numba backend.**  ONE flat float32 pass that decodes the
-   gain code per pixel and touches only the plane that pixel needs, so the
-   constant-plane traffic follows the SPATIAL CLUSTERING of the gain switching
-   rather than the switch count.  Deliberately NOT block-dispatched like (2):
-   both block-dispatched shapes were built and measured and both were slower
-   (see :func:`_fused_seg`).  numba is imported behind ``try/except``: ``import
-   pscalib`` works with numpy ALONE and falls back to (2).
-
 Traps that are deliberately respected here (each one has already bitten):
 
   * ``-0.0`` IS LOAD-BEARING.  A masked pixel whose ``(adc - poff) * gfac`` is
@@ -64,8 +67,9 @@ Traps that are deliberately respected here (each one has already bitten):
   * NO DOUBLE ROUNDING.  The reference rounds THREE times (subtract, multiply,
     mask-multiply).  Computing the chain in float64 and storing once gives ONE
     rounding and differs on millions of pixels per frame.  Every intermediate
-    here is float32, and in the numba kernel every literal is written
-    ``np.float32(...)`` because a bare python float promotes to float64.
+    here is float32, and every scalar literal is written ``np.float32(...)``
+    because a bare python float is a float64 that would promote the whole
+    expression.
   * THE BAD CODE'S SIGN.  ``gbits == 2`` has no gain stage; the reference's
     ``np.select`` default gives it ``pedoff=0``/``factor=0``, i.e. it *computes*
     ``(adc - 0.0) * 0.0``, and that multiply decides the sign of the zero (and
@@ -73,8 +77,9 @@ Traps that are deliberately respected here (each one has already bitten):
   * NaN PAYLOADS.  On x86 ``MULSS`` returns the DESTINATION operand when it is
     NaN, so ``m * v`` instead of ``v * m`` can change which payload propagates.
     Operand order is identical to the reference in every multiply.
-  * SINGLE-THREADED.  ``parallel=False``, no ``prange``, no threads.  A hidden
-    thread would manufacture a fake speedup at workers=1.
+  * SINGLE-THREADED.  Plain numpy ufuncs on one thread, no thread pool, no
+    ``concurrent.futures``, no BLAS call.  A hidden thread would manufacture a
+    fake speedup at workers=1.
 
 The reference this is written against is pscalib c5ce538,
 ``pscalib.apply.jungfrau.calib_jungfrau`` (preserved verbatim as
@@ -92,8 +97,6 @@ __all__ = [
     "memo", "memo_clear", "memo_stats", "memo_size",
     "derive_poff", "derive_gfac",
     "calib_jungfrau_fast", "backend_info",
-    "NUMBA_AVAILABLE", "NUMBA_IMPORT_ERROR",
-    "assert_kernels_are_float32_only",
 ]
 
 #: 14-bit ADC mask -- psana ``UtilsJungfrau.MSK``.
@@ -145,8 +148,11 @@ TILE_ROWS = _env_int("PSCALIB_CALIB_TILE_ROWS", 128)
 #: frames, so any per-tile mixture of the two is byte-exact too.
 DENSE_FRAC = _env_float("PSCALIB_CALIB_DENSE_FRAC", 0.60)
 
-#: ``auto`` (numba if importable, else numpy) | ``numpy`` | ``numba`` |
-#: ``reference`` (the verbatim c5ce538 expression -- for cross-checking).
+#: ``auto`` (== ``numpy``: the numpy hybrid is the ONLY compute backend) |
+#: ``numpy`` | ``reference`` (the verbatim c5ce538 expression, handled one level
+#: up in :mod:`pscalib.apply.jungfrau` -- for cross-checking).
+#: ANY other value -- in particular the name of any JIT or compiled accelerator
+#: -- is a hard ``ValueError``; see :func:`calib_jungfrau_fast`.
 BACKEND = os.environ.get("PSCALIB_CALIB_BACKEND", "auto")
 
 
@@ -317,263 +323,29 @@ def _prep_mask(mask, hoist):
 
 
 # ==========================================================================
-# 3. The OPTIONAL fused numba backend
+# 3. Backend introspection
 # ==========================================================================
-# ``import pscalib`` MUST work with numpy alone, so numba is imported here
-# behind try/except and every failure mode degrades to the numpy hybrid.
-#   * cache=False  -- cache=True would race across the 16 Ray worker processes
-#                     all writing __pycache__ into the installed worktree.
-#   * fastmath=False -- fastmath licenses reassociation and FMA contraction,
-#                     both of which break bit-exactness.
-#   * parallel=False -- pre-committed integrity rule: single-threaded only.
-NUMBA_AVAILABLE = False
-NUMBA_IMPORT_ERROR = None
-NUMBA_VERSION = None
-try:
-    import numba as _numba
-    from numba import njit as _njit
-    NUMBA_AVAILABLE = True
-    NUMBA_VERSION = getattr(_numba, "__version__", "?")
-except ImportError as _exc:                                # pragma: no cover
-    NUMBA_IMPORT_ERROR = "ImportError: %s" % (_exc,)
-except Exception as _exc:                                  # pragma: no cover
-    NUMBA_IMPORT_ERROR = "%s: %s" % (type(_exc).__name__, _exc)
-
-#: raw dtypes the fused kernel may handle.  Restricted on purpose: for a uint64
-#: raw, ``v & 0x3fff`` promotes to float64 under numba's typing rules, which
-#: would silently reintroduce double rounding.  Anything else falls back to the
-#: numpy hybrid, which handles every dtype.
-_NUMBA_RAW_DTYPES = frozenset(np.dtype(t) for t in
-                              (np.uint8, np.int8, np.uint16, np.int16,
-                               np.uint32, np.int32, np.int64))
-#: mask dtypes the fused kernel may handle (all convert to float32 by a single
-#: correctly-rounded cast, exactly as the reference's ``.astype(np.float32)``).
-_NUMBA_MASK_DTYPES = frozenset(np.dtype(t) for t in
-                               (np.bool_, np.uint8, np.int8, np.uint16,
-                                np.int16, np.uint32, np.int32, np.int64,
-                                np.float16, np.float32, np.float64))
-
-_fused_seg = None
-_fused_seg_masked = None
-
-if NUMBA_AVAILABLE:                                        # pragma: no branch
-
-    @_njit(cache=False, fastmath=False, parallel=False, nogil=True,
-           boundscheck=False)
-    def _fused_seg(arr, po0, po1, po2, gf0, gf1, gf2, out):     # noqa: F811
-        """One segment, NO mask.  EVERY intermediate is explicitly float32.
-
-        ``code = (v >> 14) & 0xFF`` reproduces the reference's
-        ``(arr >> BSH).astype(np.uint8)`` truncation EXACTLY -- including for a
-        signed raw word (arithmetic shift then wrap to 8 bits) and for a wide
-        code such as 0x100, which the reference collapses to stage 0.  Codes
-        ``0`` / ``1`` / ``3`` select stages 0 / 1 / 2; ANYTHING else is the BAD
-        code and takes the reference's ``np.select`` default lane, i.e. it
-        COMPUTES ``(adc - 0.0) * 0.0`` -- never a literal zero -- so the sign of
-        the zero is decided by the multiply.
-
-        This is deliberately ONE FLAT LOOP over the segment.  Two more elaborate
-        shapes were built and MEASURED, and BOTH were slower, so both were
-        discarded (see IMPL_PROGRESS.txt, jobs 34301838 / 34302162):
-
-          * classifying blocks of columns inside the kernel with an OR-scan and
-            dispatching to a specialised loop per block: the scalar OR chain
-            alone cost as much as the whole stage-0 pass;
-          * the same dispatch with the classifier PRECOMPUTED by a vectorised
-            ``np.bitwise_or.reduce`` pre-pass: still 1.7x slower than this flat
-            loop even at one block per row (46.5 vs 25.3 ms on a pure-stage-0
-            frame, normalised against the numpy path on the same node).  The
-            nested block loop is what costs it -- numba stops unrolling.
-
-        So the three-case dispatch lives in the NUMPY path, where the reductions
-        are vectorised and the specialised passes are whole-array ufuncs; here a
-        single tight loop wins.
-
-        ``np.float32(0)`` -- with an INT literal -- not ``np.float32(0.0)``: a
-        python float literal is a float64 constant, and although numba
-        immediately narrows it, it makes the word appear in the annotated types
-        and so defeats the structural assertion below.  An int literal converts
-        to the identical ``+0.0f``.
-        """
-        zero = np.float32(0)
-        nrow, ncol = arr.shape
-        for r in range(nrow):
-            for c in range(ncol):
-                v = arr[r, c]
-                code = (v >> 14) & 0xFF
-                x = np.float32(v & 0x3fff)
-                if code == 0:
-                    x = x - po0[r, c]
-                    x = x * gf0[r, c]
-                elif code == 1:
-                    x = x - po1[r, c]
-                    x = x * gf1[r, c]
-                elif code == 3:
-                    x = x - po2[r, c]
-                    x = x * gf2[r, c]
-                else:
-                    x = x - zero
-                    x = x * zero
-                out[r, c] = x
-
-    @_njit(cache=False, fastmath=False, parallel=False, nogil=True,
-           boundscheck=False)
-    def _fused_seg_masked(arr, po0, po1, po2, gf0, gf1, gf2, msk, out):  # noqa: F811,E501
-        """One segment, WITH the mask.  See :func:`_fused_seg` for the decode.
-
-        The mask multiply keeps the reference's operand order (``arrf *= maskf``
-        -> the running value is the DESTINATION), which is what decides which NaN
-        payload survives on x86, and it is NEVER short-circuited: a masked pixel
-        whose value is finite-negative must come out as ``-0.0``, and a masked
-        pixel under a non-finite mask must come out as NaN.
-        """
-        zero = np.float32(0)
-        nrow, ncol = arr.shape
-        for r in range(nrow):
-            for c in range(ncol):
-                v = arr[r, c]
-                code = (v >> 14) & 0xFF
-                x = np.float32(v & 0x3fff)
-                if code == 0:
-                    x = x - po0[r, c]
-                    x = x * gf0[r, c]
-                elif code == 1:
-                    x = x - po1[r, c]
-                    x = x * gf1[r, c]
-                elif code == 3:
-                    x = x - po2[r, c]
-                    x = x * gf2[r, c]
-                else:
-                    x = x - zero
-                    x = x * zero
-                out[r, c] = x * np.float32(msk[r, c])
-
-
-def _numba_usable(raw, mprep, poff, gfac):
-    if not NUMBA_AVAILABLE:
-        return False
-    if np.dtype(raw.dtype) not in _NUMBA_RAW_DTYPES:
-        return False
-    if poff.dtype != np.float32 or gfac.dtype != np.float32:
-        return False
-    if mprep is not None and np.dtype(mprep.dtype) not in _NUMBA_MASK_DTYPES:
-        return False
-    return True
-
-
-def _annotation_lines(fn):
-    """The TYPE-ANNOTATION lines of ``inspect_types`` output, source echo dropped.
-
-    ``inspect_types`` interleaves the function's own source (which here includes
-    docstrings that talk ABOUT float64) with numba's annotations, and every
-    annotation line begins with ``#``.  Scanning the raw text would match the
-    prose, so filter to the annotations first.
-    """
-    import io
-    buf = io.StringIO()
-    fn.inspect_types(file=buf)
-    return [ln.strip() for ln in buf.getvalue().splitlines()
-            if ln.strip().startswith("#")]
-
-
-def _float64_lines(fn):
-    """Annotated-type lines of every compiled specialization mentioning float64.
-
-    Split into (hard, benign).  BENIGN is exactly one shape: a ``float64`` that
-    is the ARGUMENT of an explicit narrowing cast (``(float64,) -> float32``, the
-    ``np.float32(...)`` constructor) or the declared type of a float64 *input
-    array* (a float64 ``mask``, which the reference itself narrows with
-    ``.astype(np.float32)``) or a ``getitem`` reading one element out of it.
-    Everything else is HARD: a float64 that participates in arithmetic, which is
-    exactly the double-rounding bug.
-    """
-    hard, benign = [], []
-    for s in _annotation_lines(fn):
-        if "float64" not in s:
-            continue
-        if ("-> float32" in s                      # narrowing cast
-                or "array(float64" in s            # a float64 INPUT array
-                or "static_getitem" in s or "getitem" in s):
-            benign.append(s)
-        else:
-            hard.append(s)
-    return hard, benign
-
-
-def assert_kernels_are_float32_only(verbose=False):
-    """STRUCTURALLY prove no float64 leaked into the fused kernels.
-
-    Compiles both kernels and scans every annotated type numba recorded
-    (``inspect_types``) for ``float64``.  This catches the double-rounding bug
-    WITHOUT needing the right data, which matters because Sterbenz' lemma makes
-    ``(a - b)`` exact -- and therefore hides the bug -- on ~80% of real pixels.
-
-    Two assertions, the first strictly stronger than the second:
-
-      1. on the CANONICAL specialization (uint16 raw, uint8 mask -- what the
-         detector and the derived status mask actually are) the annotated types
-         must contain the string ``float64`` **exactly zero times**;
-      2. on every specialization, no float64 may appear anywhere except as the
-         argument of an explicit narrowing cast or as a float64 input array (a
-         float64 ``mask``, which the reference narrows too).
-
-    Raises ``AssertionError`` on violation; otherwise returns a report dict.
-    """
-    if not NUMBA_AVAILABLE:
-        return {"numba": False, "reason": NUMBA_IMPORT_ERROR}
-    import io
-    raw = np.array([[0, 1 << 14, 3 << 14, 2 << 14]], dtype=np.uint16)
-    pl = [np.zeros((1, 4), np.float32) for _ in range(3)]
-    gl = [np.ones((1, 4), np.float32) for _ in range(3)]
-    out = np.empty((1, 4), np.float32)
-    msk = np.ones((1, 4), np.uint8)
-    # exercise ALL THREE dispatch cases (the tiny raw carries codes 0/1/2/3 so
-    # block 0 lands in the general case; blk=1 forces per-pixel classification,
-    # which reaches the hi==0 and hi==0x4000 branches too).
-    _fused_seg(raw, pl[0], pl[1], pl[2], gl[0], gl[1], gl[2], out)
-    _fused_seg_masked(raw, pl[0], pl[1], pl[2], gl[0], gl[1], gl[2], msk, out)
-
-    report = {"numba": True, "numba_version": NUMBA_VERSION}
-    for name, fn in (("_fused_seg", _fused_seg),
-                     ("_fused_seg_masked", _fused_seg_masked)):
-        ann = _annotation_lines(fn)
-        n_all = sum(ln.count("float64") for ln in ann)
-        hard, benign = _float64_lines(fn)
-        sigs = [str(s) for s in fn.nopython_signatures]
-        report[name] = {
-            "n_signatures": len(sigs), "signatures": sigs,
-            "n_annotated_lines": len(ann),
-            "n_float64_occurrences_total": n_all,
-            "n_hard_float64_lines": len(hard),
-            "n_benign_float64_lines": len(benign),
-            "hard_float64_lines": hard[:20],
-            "benign_float64_lines": benign[:6] if verbose else [],
-        }
-        assert not hard, (
-            "float64 LEAKED into numba kernel %s -- that is DOUBLE ROUNDING; "
-            "the reference rounds THREE times in float32.  Offending annotated "
-            "types:\n%s" % (name, "\n".join(hard[:20])))
-        assert all("float64" not in s for s in sigs), (
-            "float64 in a %s signature: %s" % (name, sigs))
-        # assertion (1): the canonical specialization must be float64-FREE.
-        if len(sigs) == 1:
-            assert n_all == 0, (
-                "the canonical (uint16 raw / uint8 mask) specialization of %s "
-                "mentions float64 %d times:\n%s"
-                % (name, n_all, "\n".join((hard + benign)[:20])))
-        report[name]["canonical_float64_free"] = (len(sigs) == 1 and n_all == 0)
-    return report
+#: The compute backends this module implements.  ONE entry, on purpose:
+#: ``reference`` is not in here because it is dispatched one level up, in
+#: :func:`pscalib.apply.jungfrau.calib_jungfrau`, and never reaches this module.
+COMPUTE_BACKENDS = ("numpy",)
 
 
 def backend_info():
-    """What the fast path will actually use, and why."""
+    """What the fast path will actually use, and why.
+
+    ``compute_backend`` is ALWAYS ``"numpy"``: the tiled pure-numpy hybrid of
+    section 4 is the only kernel that exists.  ``backend`` echoes the
+    ``PSCALIB_CALIB_BACKEND`` request (``auto`` / ``numpy`` / ``reference``).
+    """
     return {
         "backend": BACKEND,
+        "compute_backend": "numpy",
+        "compute_backends": list(COMPUTE_BACKENDS),
+        "kernel": "numpy_hybrid",
+        "compiled_extensions": [],
         "tile_rows": TILE_ROWS,
         "dense_frac": DENSE_FRAC,
-        "numba_available": NUMBA_AVAILABLE,
-        "numba_version": NUMBA_VERSION,
-        "numba_import_error": NUMBA_IMPORT_ERROR,
         "numpy_version": np.__version__,
     }
 
@@ -739,26 +511,6 @@ def _hybrid_numpy(raw, poff, gfac, mprep, out, step, dense_frac):
     return census
 
 
-def _fused_numba(raw, poff, gfac, mprep, out, blk=None):
-    """Drive the fused kernel segment by segment (spatial blocking only).
-
-    ``blk`` is accepted and IGNORED: it selected the per-column-block dispatch
-    that measurement rejected (see :func:`_fused_seg`).  Kept in the signature so
-    the campaign's sweep scripts still run and report the same number.
-    """
-    nseg = raw.shape[0]
-    p0, p1, p2 = poff[0], poff[1], poff[2]
-    g0, g1, g2 = gfac[0], gfac[1], gfac[2]
-    if mprep is None:
-        for s in range(nseg):
-            _fused_seg(raw[s], p0[s], p1[s], p2[s], g0[s], g1[s], g2[s], out[s])
-    else:
-        for s in range(nseg):
-            _fused_seg_masked(raw[s], p0[s], p1[s], p2[s],
-                              g0[s], g1[s], g2[s], mprep[s], out[s])
-    return {"numba_segments": nseg}
-
-
 # ==========================================================================
 # 5. The entry point
 # ==========================================================================
@@ -769,8 +521,10 @@ LAST_CALL = {}
 def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
                         mask=None, tile_rows=None, dense_frac=None,
                         backend=None, hoist=True, out=None, block_cols=None):
-    # ``block_cols`` is accepted and ignored (see _fused_numba); it selected a
-    # kernel shape that measurement rejected.
+    # ``block_cols`` is accepted and IGNORED.  It used to select a per-column
+    # block dispatch inside the deleted fused kernel; the argument is kept so the
+    # campaign's existing sweep scripts still run (and now simply report the
+    # numpy hybrid's number for every value).
     """Bit-identical fast twin of ``pscalib.apply.jungfrau.calib_jungfrau``.
 
     The extra keyword arguments are tuning / diagnostic knobs only; the public
@@ -815,14 +569,28 @@ def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
     if out is None:
         out = np.empty(raw.shape, dtype=np.float32)
 
-    if backend not in ("auto", "numpy", "numba"):
-        # 'reference' is a knob of the PUBLIC calib_jungfrau (which routes to
-        # calib_jungfrau_reference); reaching here with it would silently run the
-        # numpy hybrid and mislabel the result, so refuse instead.
+    if backend not in COMPUTE_BACKENDS and backend != "auto":
+        # LOUD, never a silent fallback.  Two kinds of caller land here and both
+        # must be refused rather than quietly given the numpy hybrid:
+        #   * someone asking for a JIT / compiled accelerator by name.  There is
+        #     none to fall back FROM (see the module docstring), and a caller who
+        #     asked for one and silently got numpy would mislabel every timing
+        #     they then published.  The value they asked for is echoed with %r,
+        #     so the message names it without this file ever mentioning it.
+        #   * 'reference', which is a knob of the PUBLIC calib_jungfrau (it
+        #     routes to calib_jungfrau_reference one level up and never reaches
+        #     here); running the hybrid for it would mislabel the result too.
         raise ValueError(
-            "backend must be 'auto', 'numpy' or 'numba'; got %r "
-            "(use pscalib.apply.jungfrau.calib_jungfrau_reference for the "
-            "verbatim reference)" % (backend,))
+            "backend=%r is not available.  The pure-numpy hybrid is the ONLY "
+            "compute backend pscalib has: there is no JIT and no compiled "
+            "extension anywhere under src/ (branch cand/calib-numpy-8x, the "
+            "numpy-only jungfrau cube campaign, forbids every compiled "
+            "accelerator).  Use 'numpy', or 'auto', which means the same thing. "
+            "For the verbatim c5ce538 expression set "
+            "PSCALIB_CALIB_BACKEND=reference or call "
+            "pscalib.apply.jungfrau.calib_jungfrau_reference directly.  This "
+            "raises instead of falling back so that a measurement cannot be "
+            "mislabelled." % (backend,))
 
     # ---- SIGNED / non-unsigned raw: route to the verbatim reference ------
     # The reference classifies the gain code as ``(arr >> 14).astype(np.uint8)``,
@@ -831,14 +599,12 @@ def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
     # and renders as 0.0.  The numpy hybrid's classifier ``a >= 0x4000`` is
     # False for every negative word, so such a pixel never enters the residual
     # set nor the gather fixup and silently keeps its stage-0 base value -- an
-    # error of order 3e4 ADU, not a sign-of-zero.  The numba kernel uses
-    # ``(v >> 14) & 0xFF``, which wraps as the reference does, so the two
-    # backends also DISAGREED with each other on signed input.
+    # error of order 3e4 ADU, not a sign-of-zero.
     # Real jungfrau raw is uint16 (the dataset, the fixture and the public
     # docstring all say so), so this was latent and no measured number in this
     # campaign is affected -- but the pure-numpy path is the byte-exact
-    # fallback and must stay one.  Deferring to the reference fixes both the
-    # exactness gap and the backend disagreement by construction.
+    # fallback and must stay one.  Deferring to the reference closes the
+    # exactness gap by construction.
     if raw.dtype.kind != "u":
         from .jungfrau import calib_jungfrau_reference
         res = calib_jungfrau_reference(raw, ped_src, gain_src,
@@ -855,29 +621,10 @@ def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
         })
         return res
 
-    used = backend
-    if backend == "auto":
-        used = "numba" if _numba_usable(raw, mprep, poff, gfac) else "numpy"
-    elif backend == "numba" and not _numba_usable(raw, mprep, poff, gfac):
-        raise RuntimeError(
-            "backend='numba' requested but unusable here (numba_available=%s, "
-            "raw.dtype=%s, mask.dtype=%s)"
-            % (NUMBA_AVAILABLE, raw.dtype,
-               None if mprep is None else mprep.dtype))
-
-    if used == "numba":
-        try:
-            info = _fused_numba(raw, poff, gfac, mprep, out, block_cols)
-        except Exception as exc:                       # pragma: no cover
-            if backend == "numba":
-                raise
-            used = "numpy"
-            info = _hybrid_numpy(raw, poff, gfac, mprep, out,
-                                 int(tile_rows), float(dense_frac))
-            info["numba_fallback_reason"] = "%s: %s" % (type(exc).__name__, exc)
-    else:
-        info = _hybrid_numpy(raw, poff, gfac, mprep, out,
-                             int(tile_rows), float(dense_frac))
+    # 'auto' and 'numpy' are the same thing; the numpy hybrid is the only kernel.
+    used = "numpy"
+    info = _hybrid_numpy(raw, poff, gfac, mprep, out,
+                         int(tile_rows), float(dense_frac))
 
     LAST_CALL.clear()
     LAST_CALL.update(info)

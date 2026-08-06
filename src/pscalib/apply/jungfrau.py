@@ -170,9 +170,12 @@ def calib_jungfrau(raw, pedestals, pixel_gain, pixel_offset=None, mask=None):
       blocks the segment into spatial tiles and picks, per tile, the cheapest
       exact strategy from a cheap ``uint16`` reduction of that tile (pure stage 0
       / dense two-plane blend / stage-0 pass plus a sparse gather).
-    * if ``numba`` happens to be importable, a single fused float32 pass replaces
-      the tiled numpy passes.  ``numba`` is strictly OPTIONAL -- ``import
-      pscalib`` works with numpy alone and silently uses the numpy path.
+    * that tiled hybrid is the ONLY compute backend.  There is no JIT and no
+      compiled kernel: ``import pscalib`` needs numpy and the python stdlib and
+      nothing else.  ``PSCALIB_CALIB_BACKEND`` accepts ``auto`` / ``numpy`` /
+      ``reference``; asking for anything else -- a compiled accelerator, say --
+      is a hard ``ValueError``, never a silent fallback, so a measurement
+      cannot be mislabelled.
 
     The tile choice depends only on the contents of the frame being calibrated,
     never on how events are grouped, so the result is invariant under any event
