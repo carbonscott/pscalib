@@ -38,6 +38,7 @@ from ._fastcalib import (                       # noqa: F401
     BACKEND as _BACKEND,
     calib_jungfrau_fast as _calib_jungfrau_fast,
     backend_info,
+    check_out_buffer as _check_out_buffer,
 )
 
 #: 14-bit ADC mask -- psana ``UtilsJungfrau.MSK`` (``0x3fff``, ``(1<<14)-1``).
@@ -51,7 +52,7 @@ N_GAIN_STAGES = 3
 
 
 def calib_jungfrau_reference(raw, pedestals, pixel_gain,
-                             pixel_offset=None, mask=None):
+                             pixel_offset=None, mask=None, out=None):
     """The VERBATIM c5ce538 expression -- the byte-exactness oracle.
 
     This is the definition of correctness for :func:`calib_jungfrau`, kept in
@@ -92,12 +93,23 @@ def calib_jungfrau_reference(raw, pedestals, pixel_gain,
         is treated as 0 (matching psana / the snapshot, where it may be absent).
     mask : ndarray or None, shape ``(S, 512, 1024)``
         Per-segment status mask (0 = bad pixel).  ``None`` => no masking.
+    out : ndarray or None, shape ``raw.shape``, float32
+        OPTIONAL pre-allocated output buffer, so a per-event caller can reuse
+        one 67 MB array instead of first-touching fresh pages every event.
+        ``None`` (the default) allocates, exactly as before.  A supplied buffer
+        is validated (ndarray / exact dtype / exact shape / writeable) and a
+        mismatch RAISES -- it is never silently ignored (see
+        :func:`pscalib.apply._fastcalib.check_out_buffer`).  The result is
+        bit-identical either way: every element of the returned array is
+        assigned by the segment loop below (``s`` runs over all of
+        ``raw.shape[0]`` and each iteration assigns the whole segment), so the
+        buffer's prior contents cannot survive anywhere.
 
     Returns
     -------
     ndarray, shape ``(N, 512, 1024)``, float32
         Calibrated stack in ADU.  Bad-gain-code pixels (``gbits == 2``) and
-        masked pixels are 0.
+        masked pixels are 0.  This IS ``out`` when ``out`` was supplied.
 
     Notes
     -----
@@ -132,7 +144,15 @@ def calib_jungfrau_reference(raw, pedestals, pixel_gain,
                      where=pixel_gain != 0).astype(np.float32)
 
     nseg = raw.shape[0]
-    out = np.zeros(raw.shape, dtype=np.float32)
+    # ``np.zeros`` is kept for the allocating path so this stays the VERBATIM
+    # c5ce538 expression.  A caller-supplied buffer is not zeroed -- and does
+    # not need to be: the loop below assigns ``out[s]`` for every s in
+    # range(raw.shape[0]), i.e. every element of the array, so no pre-existing
+    # byte can reach the result.  (Validated first, never silently ignored.)
+    if out is None:
+        out = np.zeros(raw.shape, dtype=np.float32)
+    else:
+        out = _check_out_buffer(out, raw.shape)
     for s in range(nseg):
         arr = raw[s]                                    # (512,1024) uint16
         # gain bits: 00/01/11 select stages 0/1/2; 10 (==2) is the bad code.
@@ -151,7 +171,8 @@ def calib_jungfrau_reference(raw, pedestals, pixel_gain,
     return out
 
 
-def calib_jungfrau(raw, pedestals, pixel_gain, pixel_offset=None, mask=None):
+def calib_jungfrau(raw, pedestals, pixel_gain, pixel_offset=None, mask=None,
+                   out=None):
     """Calibrate a raw Jungfrau stack into ADU, fully offline (numpy only).
 
     Byte-identical to :func:`calib_jungfrau_reference` (the verbatim c5ce538
@@ -181,13 +202,22 @@ def calib_jungfrau(raw, pedestals, pixel_gain, pixel_offset=None, mask=None):
     never on how events are grouped, so the result is invariant under any event
     partition; blocking is over SPATIAL axes only.
 
+    ``out=`` (optional, default ``None`` == allocate, exactly as before) lets a
+    per-event caller reuse ONE output buffer instead of first-touching 67 MB of
+    fresh pages every event.  It is honoured on BOTH backends -- the tiled
+    hybrid writes straight into it, and the ``reference`` backend fills it -- so
+    ``PSCALIB_CALIB_BACKEND=reference`` keeps working with a buffer.  The output
+    is BIT-IDENTICAL with and without it (every element is assigned either way);
+    a buffer of the wrong dtype/shape RAISES rather than being ignored.
+
     See :func:`calib_jungfrau_reference` for the full parameter documentation.
     """
     if _BACKEND == "reference":
         return calib_jungfrau_reference(raw, pedestals, pixel_gain,
-                                        pixel_offset=pixel_offset, mask=mask)
+                                        pixel_offset=pixel_offset, mask=mask,
+                                        out=out)
     return _calib_jungfrau_fast(raw, pedestals, pixel_gain,
-                                pixel_offset=pixel_offset, mask=mask)
+                                pixel_offset=pixel_offset, mask=mask, out=out)
 
 
 def gain_stage_map(raw):

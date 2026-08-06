@@ -518,6 +518,61 @@ def _hybrid_numpy(raw, poff, gfac, mprep, out, step, dense_frac):
 LAST_CALL = {}
 
 
+def check_out_buffer(out, shape, dtype=np.float32, name="out"):
+    """Validate a caller-supplied ``out=`` buffer; return it, or RAISE.
+
+    The whole point of ``out=`` is that the caller reuses ONE 67 MB buffer
+    across events instead of first-touching fresh pages every event.  A
+    silently-ignored ``out=`` would therefore be the worst possible failure
+    mode: the caller keeps paying the allocation it thought it had removed,
+    the result is written somewhere else, and the buffer it later reads holds
+    stale data from the previous event -- a WRONG cube, with no error anywhere.
+    So every mismatch is a hard error naming what was expected and what came.
+
+    Requirements, all checked:
+
+    * a real ``numpy.ndarray`` (not a list, not a memoryview) -- the kernel
+      writes into it with basic slicing and ``ufunc(..., out=)``;
+    * exactly ``dtype`` (default float32).  A float64 buffer would make the
+      kernel's in-place ``-=`` / ``*=`` round in float64 and CHANGE OUTPUT BITS
+      (the reference rounds three times in float32), so an "obviously
+      compatible" wider dtype is refused, not upcast into;
+    * exactly ``shape``.  Broadcasting is NOT accepted: it would write a
+      different array than the one the caller holds;
+    * writeable.
+
+    Contiguity is deliberately NOT required: the hybrid kernel writes
+    ``out[s][r0:r1]`` slices and its sparse fixup already handles a
+    non-contiguous tile (see :func:`_gather_fixup`), so a strided view is
+    correct -- merely slower.
+    """
+    want = np.dtype(dtype)
+    shape = tuple(int(x) for x in shape)
+    if not isinstance(out, np.ndarray):
+        raise TypeError(
+            "%s= must be a numpy.ndarray of shape %s and dtype %s; got %s. "
+            "(%s= is an optional output buffer: pass None -- the default -- to "
+            "let pscalib allocate one.)"
+            % (name, shape, want, type(out).__name__, name))
+    if out.dtype != want:
+        raise ValueError(
+            "%s= has dtype %s but must be exactly %s: the calibration rounds in "
+            "%s and writing through a wider buffer would change output bits. "
+            "Allocate it as np.empty(%s, dtype=np.%s)."
+            % (name, out.dtype, want, want, shape, want))
+    if out.shape != shape:
+        raise ValueError(
+            "%s= has shape %s but must be exactly %s (the shape of raw); "
+            "broadcasting into a differently-shaped buffer is refused because "
+            "the caller would then be reading a different array than the one "
+            "that was written." % (name, out.shape, shape))
+    if not out.flags.writeable:
+        raise ValueError(
+            "%s= is not writeable (out.flags.writeable is False); the "
+            "calibration writes its result into it." % (name,))
+    return out
+
+
 def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
                         mask=None, tile_rows=None, dense_frac=None,
                         backend=None, hoist=True, out=None, block_cols=None):
@@ -568,6 +623,12 @@ def calib_jungfrau_fast(raw, pedestals, pixel_gain, pixel_offset=None,
     # OVERWRITE already-assigned elements.  (Proved by the gate's poison test.)
     if out is None:
         out = np.empty(raw.shape, dtype=np.float32)
+    else:
+        # A caller-supplied buffer is VALIDATED, never silently ignored and
+        # never silently replaced by a fresh allocation -- see
+        # :func:`check_out_buffer` for why a quiet fallback would be the worst
+        # possible failure mode here.
+        out = check_out_buffer(out, raw.shape)
 
     if backend not in COMPUTE_BACKENDS and backend != "auto":
         # LOUD, never a silent fallback.  Two kinds of caller land here and both
