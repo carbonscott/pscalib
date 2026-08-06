@@ -1,0 +1,171 @@
+{
+  "goal": "Take jungfrau cube throughput at workers=1 from the measured 645.3 ms/event to at most 80.7 ms/event -- at least 8.0x -- using numpy alone, with no numba anywhere in pscalib, while holding byte-exactness against the pure-numpy reference, purity of that reference path, partition invariance, and a bit-identical binned cube.",
+  "slug": "pscalib-numpy-only-8x",
+  "contract": ".goal/pscalib-numpy-only-8x.json",
+  "created": "2026-08-06T05:55:46+00:00",
+  "limits": {
+    "subagents_min": 2,
+    "subagents_max": 5,
+    "min_iterations": 5,
+    "max_turns": 15
+  },
+  "iterations": [
+    {
+      "n": 1,
+      "thought": "Read the contract, SETUP.md, the candidate's _fastcalib.py numpy hybrid, jungfrau.py, the 1181-line harness and the paired sbatch driver first-hand. Budget arithmetic: 645.3 = read 38.7 + stack 10.4 + calib 560.9 + harness-accum 35.3; target <= 80.66. Even a free calib leaves 84.4 (7.65x), so the harness prefetch is mandatory, not optional. Working target: read hidden by prefetch, stack ~6, calib ~40, accum ~18 => ~69 ms => 9.3x. Iteration 1 must (i) stand up a NEW worktree with numba deleted (feasibility gate), (ii) stand up the psana-free inner-loop instrument on a milano node that measures calib ms/frame + the three-conjunct bit gate, and (iii) re-measure the two denominators (incumbent calib, candidate numpy calib) and the harness accumulate block, all on milano, before touching a single line of optimisation. Source reading already yielded four concrete numpy moves, recorded here so the prediction is falsifiable: (M1) np.subtract(a, p0, out=t) fuses the tile assignment and the subtract, saving one full 512 KB round-trip of t per tile; (M2) in case C the `& MSK` is provably droppable because every pixel with a high bit satisfies a>=0x4000 and is therefore in the residual set and overwritten wholesale; (M3) the trailing mask multiply is skippable on tiles whose mask is all-ones, and all-ones-ness is a per-run constant that can be hoisted into the memo; (M4) interleaving p1 and g1 into one (seg,row,col,2) array halves the gather's cache-line touches.",
+      "prediction": {
+        "P1_candidate_numpy_calib_ms_per_frame_8_real_fixture_frames_milano": "45-60 (the _fastcalib docstring's own tuning table says mean 50.92 at dense_frac=0.60, tile_rows=128)",
+        "P2_incumbent_c5ce538_calib_ms_per_frame_same_frames_milano": "450-650 (July end-to-end decomposition put it at 560.9)",
+        "P3_harness_accumulate_block_ms_per_event_milano": "28-45 (isfinite 84 MB + count 17 MB + where/alloc 134 MB + float64 += 335 MB + uint32 += 134 MB ~= 700 MB at 17-20 GB/s ~= 35-41; July said 35.3)",
+        "P4_numba_strip_is_perf_neutral": "candidate calib ms/frame with numba deleted equals candidate calib ms/frame at PSCALIB_CALIB_BACKEND=numpy to within +-3%",
+        "P5_stack_ms_per_event": "8-13 (July said 10.4); NOT measured this iteration",
+        "P6_bit_gate_on_unmodified_candidate": "PASS with maxabsdiff exactly 0, 0 differing bit patterns, 0 sign-of-zero disagreements on all 8 frames"
+      },
+      "delegated": [
+        {
+          "agent": "planner",
+          "task": "attack the iteration-1 decomposition, refute the bit-exactness arguments for M1/M2/M3 and the harness tricks, pre-mortem, re-rank moves, stopping rule",
+          "model": "opus",
+          "effort": "xhigh"
+        },
+        {
+          "agent": "worker:numba-strip",
+          "task": "delete the optional numba backend from the new worktree cand/calib-numpy-8x and prove numpy-only importability",
+          "model": "inherit",
+          "effort": "inherit"
+        },
+        {
+          "agent": "worker:milano-instrument",
+          "task": "build the psana-free inner-loop instrument and re-measure incumbent calib, candidate-numpy calib, the harness accumulate block and the dense_frac sweep in ONE exclusive milano job",
+          "model": "inherit",
+          "effort": "inherit"
+        }
+      ],
+      "integrated": "ALL SIX iteration-1 predictions HELD. Job 34315699 on sdfmilan256 (exclusive, 120 CPU): incumbent c5ce538 mean calib 556.42 ms/frame over the 8 real fixture frames (P2 band 450-650 HIT, and within 0.8% of July's harness-derived 560.9 -- the instrument is CALIBRATED against the harness, which is the planner's demanded conservation identity); candidate 5c432ec pure-numpy mean calib 52.92 ms/frame (P1 band 45-60 HIT). Harness accumulate block measured DIRECTLY for the first time: total 43.94 ms/event, decomposed isfinite 3.47 + finite.sum 4.44 + np.where 16.73 + float64 += 11.51 + uint32 += 5.25. That is ABOVE the July residual of 35.3, so the harness holds MORE headroom than the contract assumed, and np.where -- a pure 67 MB allocate-and-copy -- is the single largest term. n_nan=0 on all 8 frames, so the all-finite fast path fires 100% of the time here. np.empty first-touch of the 67 MB output costs 5.77 ms vs 3.45 reused. dense_frac re-swept on THIS node for the incumbent kernel: 0.02->61.42, 0.35->51.99, 0.60->51.68, 1e9->57.34, so 0.60 stands for the OLD kernel. Bit gate PASS on all 8 frames for both arms (negzero populations 215-4456 per frame confirm the -0.0 conjunct is live). I ran my own semantic pre-checks under the psana env's numpy 1.26.4 and they PASSED: M1 fused subtract bit-identical (exhaustive over all 65536 uint16 plus adversarial poff NaN/+-inf/+-0/+-3.4e38); M2 drop-&MSK sound for uint16/32/64; M5 mask-fold bit-identical under its guard and PROVABLY WRONG without it (the adversarial overflow case differs); the harness where=-variant of the accumulate is NOT equivalent (-0.0 trap fires) so it is forbidden; lazy nvalid bit-identical. Login-node kernel-lab smoke (3 frames, correctness meaningful, timing indicative only): every variant PASSES the three-conjunct gate, and the ordering is ref 132.8 > v0 46.8 > v1 45.4 > v2 40.0 > v3 39.3, with v4 (interleaved p1/g1 gather) a clear LOSS at 54.7 -- M4 is REJECTED on measurement, matching the planner's independent prediction that the stride-2 views would cost more than the halved cache lines. The planner independently converged on the mask fold as the single best calib move and contributed three refinements I ADOPTED: dtype=np.float32 on the fused subtract (without it uint32/int32/uint64 raw would select the float64 loop and DOUBLE-ROUND -- the uint16 fixture is structurally blind to this), deriving the case-A test from count_nonzero(sel1)==0 so the separate reduction over `a` disappears (now variant v5), and a FOURTH proof arm repeating before_orig last to bound page-cache contamination. I OVERRULED the planner on M3 only in the sense that it had already been superseded by the fold; its 'zero hit rate because every 128-row tile crosses masked chip-boundary columns' argument is recorded and M3 is dropped. Also found first-hand: the previous campaign's READSPLIT2 file measures a COLD read at 3124 ms/event at 12 MB/s -- an I/O-storm-contaminated number, not a usable baseline -- against 21.75 ms/event page-cache-warm, which is why the 4th control arm matters.",
+      "new": "New worktree _cand_worktrees/pscalib_np8x on branch cand/calib-numpy-8x, numba deleted at commit 903888b; kernel_lab.py -- a psana-free variant search harness with a three-conjunct bit gate on every variant, which measured M4 as a LOSS and the mask-fold (M5) as the largest calib win; patch_harness.py -- an md5-asserting out-of-place harness patcher implementing prefetch + reused calib/stack buffers + a data-driven all-finite fast path + lazy nvalid; semcheck.py -- numpy-1.26.4 semantic proofs for M1/M2/M5 and the harness tricks; and the first DIRECT measurement of the harness accumulate block (43.94 ms/event, np.where dominant).",
+      "remaining": "GIL/read-overlap fraction is UNMEASURED and is a go/no-go: if psdata's read does not overlap, the target is arithmetically unreachable. Kernel variants need milano numbers (login-node timings are indicative only). pscalib.calib needs out= plumbed through. The 4-arm proof sbatch and the cube bit-inertness checker do not exist yet. Fixture gbits==2 census unknown, so the bad-code lane may be untested by the gate."
+    },
+    {
+      "n": 2,
+      "thought": "Two things gate everything else and neither is measured. (1) The read/compute OVERLAP fraction: with the read serialized the calib budget is 12.6 ms against a 22 ms DRAM floor, so a low overlap fraction means the target is arithmetically unreachable and the campaign must re-scope rather than optimise. (2) Which kernel variant actually wins on milano -- the login-node ordering (v3 39.3 < v2 40.0 < v1 45.4 < v0 46.8, v4 54.7 rejected) is indicative only. So iteration 2 runs ONE milano job carrying both the variant sweep (v0/v1/v2/v3/v5 x dense_frac x tile_rows) and the overlap probe, while a second worker plumbs out= through pscalib.calib and builds the FOUR-arm proof driver plus the cube bit-inertness checker, and a fresh skeptic attacks iteration 1's numbers.",
+      "prediction": {
+        "P7_best_variant_mean_calib_ms_per_frame_milano": "36-47 (v0 measured 52.92 on this node; the login-node v3/v0 ratio of 0.84 projects 44.5, and the sel-first classifier plus a retuned dense_frac should take a few more)",
+        "P8_v4_stays_rejected": "v4 (interleaved p1/g1 gather) remains slower than v3 on milano too",
+        "P9_read_compute_overlap_fraction": "0.6-0.95 (psdata read_events is dominated by os.pread, which releases the GIL; the dgram assembly is the python-level part that will not overlap)",
+        "P10_patched_harness_accumulate_ms_per_event": "17-24 (43.94 measured minus np.where 16.73 minus uint32 += 5.25, plus a count_nonzero in place of finite.sum)",
+        "P11_cube_inertness": "the patched accumulate_slice and the original produce BIT-IDENTICAL float64 sums and uint32 nvalid maps over the same events -- 0 differing bit patterns, not a tolerance",
+        "P12_dense_frac_optimum_moves_down_for_the_folded_kernel": "the crossover drops below 0.60 once the mask multiply and one round-trip of t are gone from case C"
+      },
+      "delegated": [
+        {
+          "agent": "skeptic",
+          "task": "refute iteration 1's six claims; attack the fixture-vs-harness calibration, the accumulate measurement, the fold/subtract guards, the v4 rejection and the gate's coverage of the bad gain code",
+          "model": "opus",
+          "effort": "xhigh"
+        },
+        {
+          "agent": "worker:milano-sweep-and-overlap",
+          "task": "ONE exclusive milano job carrying the read/compute overlap probe (go/no-go), the v0..v5 variant sweep with the bit gate, dense_frac and tile_rows sweeps, and the gbits/mask census",
+          "model": "inherit",
+          "effort": "inherit"
+        },
+        {
+          "agent": "worker:out-plumbing-and-proof-driver",
+          "task": "thread out= through the public pscalib.calib surface, generate the patched harness out-of-place, prove the binned cube bit-identical, and build the four-arm proof sbatch without submitting it",
+          "model": "inherit",
+          "effort": "inherit"
+        }
+      ],
+      "integrated": "THE GO/NO-GO CLEARS. Job 34316936 on sdfmilan253 (exclusive): the stdlib prefetch thread overlaps the psdata read with compute at f_self = 0.879 cold and 0.866-0.913 warm, against a hard ceiling of 0.875 for 8 batches -- i.e. 88-91% of the theoretical maximum, so the read is effectively hidden. P9 HIT. The worker caught its own instrument lying: the naive f formula returned 2.23-2.65 in the warm phases, above its own ceiling, because T_read/T_comp and T_both had been measured on DIFFERENT event sets; it built f_self (same events, same instant, measured inside the pipeline) and flagged the naive number as unusable. Warm read is only 9.7-15 ms/event against 42.7 cold. VARIANT SWEEP, 8 frames, 5 repeats, gate PASS on every variant: ref 130.19, v0 47.29, v1 45.75, v2 41.03 (mask fold), v3 38.07 (dense fusion), v4 51.19, v5 37.29 (sel-first classifier). v4 REJECTED on milano too, P8 HIT. dense_frac for v5: 0.02->41.05 0.10->44.52 0.20->38.50 0.35->36.85 0.60->35.71 1e9->42.09, so 0.60 STANDS -- P12 MISSED, the crossover did not move down. tile_rows for v5: 32->44.96 64->39.09 128->37.72 256->35.08 512->34.25, so the optimum moved UP to 512, contradicting BOTH the contract's 'flat 128-1024' and the planner's prediction of 32/64; gate PASS at 32, 64, 256 and 512. FINAL v5/512/0.60 = 34.47 ms/frame, gate PASS -- below the P7 band of 36-47, a favourable MISS. The suspected gate hole does NOT exist: the gbits census shows code 2 (the bad lane) present at 46 pixels across the 8 frames and code 3 (stage 2) at 1510, so both lanes ARE exercised by the real-frame gate. CUBE INERTNESS PROVED, and more strongly than I specified: the worker added a second phase that poisons the stage-1/stage-2 pedestal planes to NaN, forcing 64/64 events down the patch's SLOW lane, and both phases give sums_bitdiff=0 nvalid_diff=0 counts_equal=True with n_nan matching exactly at 256565255. P11 HIT. The shared harness is byte-unchanged (md5 a29e67e5c453fb5cd31e9184fe0e3f7c) and the patched copy is cf794d11ba8689ca46cd8bc0581e8f9c. SKEPTIC VERDICTS, three of which changed what I believe. C1 QUARANTINED: the 560.9 I called harness-derived is itself a linear extrapolation from a 32-event login fit, so the 0.8% agreement was forced by construction and carries no information; worse, the candidate is 6.4x more fraction-sensitive than the incumbent in relative terms, so the fixture's mean non-G0 fraction of 0.162 against the harness's 0.2027 makes every fixture calib number ~10% OPTIMISTIC. I ADOPT the correction: v5 34.47 -> about 37.8 ms/event frac-weighted. C3 BELIEVE the inequality but QUARANTINE 43.94 as too SMALL: the microbench uses ONE bin while the harness runs nbins=10, and the skeptic's in-situ smokes put the accumulate at 49-72 ms. C4/C5 QUARANTINED, and it found a REAL DEFECT I introduced: my new gather did t.reshape(-1) with no contiguity check, where the incumbent gather checked C_CONTIGUOUS -- on a non-contiguous out= view reshape returns a silent COPY and every gathered pixel is discarded with no error, and the lab's always-contiguous output means the gate could never catch it. FIXED. It also showed my dtype=np.float32 rationale was FALSE for numpy 1.26.4 (a float32 out= already pins the loop; uint32 and uint64 are bit-exact either way); the keyword is kept as belt-and-braces and the comment corrected.",
+      "new": "The read/compute overlap fraction is MEASURED at 0.87-0.91 of its ceiling, which is the go/no-go the contract's arithmetic hangs on; a chosen production configuration (variant v5 = fused subtract + dropped &MSK + mask folded into the gain planes + fused dense blend + sel-first classifier, tile_rows=512, dense_frac=0.60) at 34.47 ms/frame gated PASS; pscalib commit db88487 threading an optional out= buffer through the public calib surface; bench_cube_calib_fast.py (md5 cf794d11ba8689ca46cd8bc0581e8f9c) proved numerically inert against the unmodified harness in BOTH the all-finite and a NaN-poisoned slow-lane phase; proof3arm.sbatch, the four-arm driver; and a silent-data-loss contiguity defect found and fixed before it reached production.",
+      "remaining": "v5 is still only in the lab -- it must be ported into pscalib_np8x with the contiguity check kept and gfm memoised on the same identity as the mask it was derived from, then re-gated. The four-arm proof job has not been submitted. The accumulate's IN-SITU cost at nbins=10 is quarantined at 43.94 and may be 49-72, which if real makes the margin thin and would promote the batched float64 accumulate from optional to necessary."
+    },
+    {
+      "n": 3,
+      "thought": "Everything is now known except the end-to-end number. Land v5 (tile_rows=512, dense_frac=0.60) into pscalib_np8x -- keeping the contiguity check the skeptic's defect report demands and memoising gfm on the SAME identity as the mask it was derived from -- re-gate it, then submit the four-arm proof job. The skeptic's quarantine of the accumulate (43.94 measured single-bin, 49-72 in situ at nbins=10) is the one thing that could still sink the margin, so a third worker prepares the batched float64 accumulate as a contingency patch level in parallel, to be measured only if the proof job comes in short.",
+      "prediction": {
+        "P13_after_orig_ms_per_event_and_ratio": "after_orig (candidate pscalib + UNMODIFIED harness) 120-150 ms/event, so before_orig/after_orig = 4.3-5.4",
+        "P14_after_fast_ms_per_event_and_ratio": "after_fast (candidate + patched harness) 65-90 ms/event, so before_orig/after_fast = 7.2-10.0. This is the threshold ratio and 8.0 sits inside the band, not at its edge -- I am NOT predicting a comfortable pass",
+        "P15_cache_control": "before_again/before_orig within 0.90-1.10; outside that the ratio is declared cache-contaminated",
+        "P16_v5_in_production_gates_clean": "the ported kernel gives max|diff| exactly 0, 0 differing bit patterns and 0 sign-of-zero disagreements against the frozen reference on all 8 frames, and the 23-test suite including the psana oracle still passes",
+        "P17_calib_contribution_in_situ": "pscalib calib lands at 38-46 ms/event in situ, i.e. the fixture's 34.47 inflated by the C1 frac correction of about 1.10"
+      },
+      "delegated": [
+        {
+          "agent": "worker:land-v5",
+          "task": "port variant v5 into pscalib_np8x with the contiguity guard, gfm memoised on the mask identity and a fail-closed fold guard; re-gate across tile_rows x dense_frac; run the full acceptance suite",
+          "model": "inherit",
+          "effort": "inherit"
+        },
+        {
+          "agent": "worker:four-arm-proof",
+          "task": "review and correct the proof driver, smoke it, then run the multi-arm 512-event proof job on one exclusive milano node and profile the fast arm in situ afterwards",
+          "model": "inherit",
+          "effort": "inherit"
+        },
+        {
+          "agent": "worker:batched-accumulate-contingency",
+          "task": "build the batched float64 accumulate as an insertion-only second patch level and prove it numerically inert without measuring any timing",
+          "model": "inherit",
+          "effort": "inherit"
+        }
+      ],
+      "integrated": "IN PROGRESS -- the proof job has not returned. Landed so far, all verified by commands I ran myself: the kernel is in production at ce3746332afc6a9dba6ec68f1b29570966fcdb06 (branch cand/calib-numpy-8x, dirty=0, src md5 dfabb28d6d5039f8b47d509b1656a863, TILE_ROWS default 512, DENSE_FRAC default 0.60, grep for numba/njit under src/ exits 1). P16 HELD: the psana oracle gives max|diff|=0.0 and array_equal=True against BOTH det.raw.calib and det.raw.image, and the 23-test acceptance suite passes with zero skips. The oracle test file was EXTENDED not weakened -- 368 insertions and ZERO deletions, both array_equal assertions intact. The port's three required tests pass, and one of them refuted MY OWN reasoning: I claimed the mask multiply could be dropped from the bad-gain-code lane for any mask in {0,1}, but a mask value of NEGATIVE ZERO flips the sign of that lane's zero, and my guard would have admitted it because -0.0 satisfies both min()>=0 and array_equal against +0.0. The landed guard rejects it and the fallback preserves the signbit. The batched float64 accumulate (H5) arrived early, insertion-only over level 1 (232 added, 0 removed) and bit-inert at K=1/4/64 across five phases, so rather than hold it in reserve I added it to the driver MYSELF as an OPTIONAL FIFTH ARM, fail-soft and unable to fail the verdict, together with RATIO_CONSERVATIVE lines that use min(before_orig, before_again) as the numerator because the first arm reads coldest and every later arm reads warm. I also closed two risks by measurement rather than by code change: a Ray task declared as the harness declares it keeps FULL CPU affinity (114 cores, not 1), so the prefetch overlap transfers; and the overlap probe's 0.879 was sitting AT its own structural ceiling of 0.875 for 8 batches, so with 32 batches in the real run the read residual is about 1 ms rather than the 4.6 ms I had projected. OPERATIONAL INCIDENT, self-inflicted and caught: my SendMessage resumed the proof worker while its original workflow turn was still live, two executions ran concurrently and each submitted a smoke job 8 seconds apart (34323649 cube4smoke on sdfmilan255, 34323653 p4smoke on sdfmilan241). Two concurrent xtc readers is precisely what destroyed three predecessor proof runs, so I cancelled 34323649 -- my own job, which the serialization guardrail requires me to police -- kept p4smoke on the more developed driver, and sent the worker a hard pre-submission squeue guard. The surviving smoke shows ARM_ORDER carrying all five arms, HARNESS_FAST2 ENABLED K=64, all three harness md5s asserted, GATE PASS, partition_invariant=1 and BITGATE OVERALL PASS=True. || PROOF JOB RETURNED. Job 34324141, node sdfmilan255, exclusive, 512 events, five arms, all VERDICT=PASS and partition_invariant=1 (20 of 20 rows), 5 GATE PASS, 5 PURITY=PASS, 0 GATE FAIL, 10 BITGATE OVERALL PASS=True across both numba-active and numba-blocked modes, every arm rc=0, BYTES_SYMMETRY 1.014 at workers=1. RATIO_MAIN before_orig/after_fast = 11.6161, target_met=True, rc=0. BUT my own cache-control tripwire FIRED: before_again/before_orig = 1.3571, far outside 0.90-1.10, because before_orig is the only arm that reads the 17.2 GB cold. So 11.62 is inflated and I do NOT publish it. Three honest baselines, all clearing 8.0: against the frozen July 645.3 the ratio is 8.395x; against the conservative min(before_orig, before_again) = 657.9 it is 8.559x; and the ABSOLUTE target is met directly, after_fast at 76.864 ms/event against the contract's 80.7 ceiling. P14 HIT on ms/event (65-90 predicted, 76.86 measured) and MISSED high on the ratio. P13 MISSED: after_orig came in at 116.14 ms/event with ratio_pscalib 7.69, far above my 4.3-5.4 band, because the cold denominator inflated it. P15 MISSED, which is the tripwire doing its job. The 512-event in-situ split settles the mechanism: patched harness read 9.10 with overlap_f=0.9692 against a structural ceiling of 0.9688 -- my extrapolation that efficiency-relative-to-ceiling carries across batch counts was right to four decimals -- stack 6.98, calib 40.24, accum 14.98, total 62.48; unmodified harness read 8.16 with overlap_f=0.0000, stack 7.91, calib 42.17, accum 41.70, total 99.94. P17 HIT: calib 40.24 in the predicted 38-46 band. THE FIFTH ARM PAID FOR ITSELF BY BEING REJECTED: RATIO_BATCH after_fast2/after_fast = 0.9523 at 512 events, and 0.53x at workers=16, so the batched float64 accumulate is a measured LOSS and is NOT adopted. Had I held it in reserve as a contingency I would have spent an entire extra turnaround discovering that.",
+      "new": "THE HEADLINE NUMBER EXISTS AND CLEARS THE THRESHOLD: slurm job 34324141 on sdfmilan255 shows after_fast at 76.864 ms/event at workers=1 against the contract's 80.7 ceiling, i.e. 8.40x against the frozen 645.3 baseline and 8.56x against the conservative in-job baseline, with pscalib contributing 7.69x and the harness patch 1.51x. Also new: the landed kernel ce37463 with the negative-zero fold guard; the five-arm driver whose cache-control arm actually caught a 1.36x contamination; and the batched float64 accumulate measured and REJECTED at 0.95x rather than assumed to help.",
+      "remaining": "Score the pre-registered void conditions; cold reader; FRONTIER table; final claims."
+    },
+    {
+      "n": 4,
+      "thought": "The proof job (34324141) is running and cannot be hurried, so iteration 4 runs the two read-only checks that do not need node time and would otherwise cost a whole extra turnaround: a FRESH skeptic that attacks the in-situ decomposition and PRE-REGISTERS what would make the forthcoming ratio untrustworthy (pre-registration matters -- a post-hoc objection to a number you have already seen is worth much less), and a cold reader that is handed the artifacts and NOTHING else and tries to establish the campaign's central claims from them alone. Both are forbidden from submitting slurm jobs so neither can disturb the measurement in flight.",
+      "prediction": {
+        "P18_skeptic_finds_at_least_one_real_defect": "the skeptic returns at least one QUARANTINE that changes what I would claim, as it did in iteration 2 (where it found the contiguity defect and the fixture-mix inflation)",
+        "P19_cold_reader_blocking_defect": "the cold reader can establish numpy-only-ness and byte-exactness from the artifacts alone, but CANNOT reproduce the end-to-end ratio without node access, and will name the absence of a single entry-point document as its blocking defect",
+        "P20_insitu_projection": "the 512-event proof job lands after_fast at 60-80 ms/event and before_orig at 600-680, so RATIO_MAIN falls in 7.8-11.0; the in-situ decomposition (stack 7.3 + calib 35.5 + accum 20.8 = 63.6 ms compute with the read overlapped) points at the middle of that band",
+        "P21_ratio_batch": "RATIO_BATCH after_fast2/after_fast at 512 events exceeds 1.0, i.e. the batched accumulate finally pays once the K=64 buffer actually fills -- it was 0.971 at 8 events where it never filled"
+      },
+      "delegated": [
+        {
+          "agent": "skeptic",
+          "task": "attack the in-situ decomposition and PRE-REGISTER, blind to the result, the conditions under which the forthcoming ratio must not be believed",
+          "model": "opus",
+          "effort": "xhigh"
+        },
+        {
+          "agent": "cold-reader",
+          "task": "given the artifacts and nothing else, attempt the campaign's four central claims and log every stumble without repairing anything",
+          "model": "inherit",
+          "effort": "xhigh"
+        }
+      ],
+      "integrated": "P18 HIT, and the pre-registration earned its keep. The skeptic, writing BLIND of job 34324141, produced seven grep-checkable void conditions. Scored against the result: V1 (the ABSOLUTE target, a check the driver never had -- it only ever tested a ratio) PASSES at 76.864 <= 80.7. V2 FIRES: before_orig at 892.86 is outside the 580-710 band the skeptic set from five predecessor incumbent runs spanning 649-885 ms/event, so the remedy it pre-specified applies and the ratio is recomputed against the frozen 645.3, giving 8.395x. V3 FIRES: cache_control_ok=False while rc=0, because the driver flags but never enforces it; the pre-specified remedy is to publish the conservative ratio, 8.5592x. V4 PASSES at 1.014 against the skeptic's tightened 1.02 (the driver's own rule would not have voided below 1.50). V5 PASSES: 5 GATE PASS, 0 GATE FAIL, 5 PURITY=PASS, all five arms rc=0. V6 PASSES: 20 partition_invariant=1, 0 zeros, and workers=16 rows exist so the check is not vacuous -- though the skeptic is right that it is an rtol=1e-5 comparison and NOT bit-identity, which is exactly why the separate cube_inertness bit-pattern proof is the load-bearing one. V7 PASSES: 10 BITGATE OVERALL PASS=True, 0 failures. The skeptic also corrected a label I had used: the in-situ 'accum' column is a RESIDUAL (tot - read - qwait - stack - calib), not an independent measurement, so its columns summing to the total is an identity rather than a validation. Its traffic model apportions the 42->15 ms delta specifically to deleting np.where (151 MB) and the eager nvalid update (151 MB), with about 6 ms of the column being the finiteness test that is present in BOTH arms. I adopt that correction: the patch removes np.where and the eager nvalid, it does not halve 'the accumulate' as a physical quantity.",
+      "new": "Seven pre-registered, grep-checkable void conditions written BLIND of the result and then scored against it: five pass, two fire, and both that fire have a pre-specified remedy that still clears 8.0 -- which is what converts a single passing job into a defensible number. Plus the correction that the in-situ 'accum' column is a residual, so the patch's win is specifically np.where and the eager nvalid update rather than 'the accumulate' as such.",
+      "remaining": "Cold-reader verdict; FRONTIER table; final claims file."
+    },
+    {
+      "n": 5,
+      "thought": "The number exists and survives its own pre-registered attack. Iteration 5 is integration, not measurement: score every prediction, assemble the FRONTIER table from the measured record so how much of the available headroom was actually taken is visible rather than asserted, finalise the claims file, and state the honest headline -- which is NOT the 11.62 the job printed, because my own cache-control arm caught a 1.36x contamination in its denominator.",
+      "prediction": {
+        "P22_honest_headline": "the defensible ratio is 8.4-8.6x, not 11.6x: 8.395x against the frozen 645.3 baseline and 8.559x against the conservative in-job baseline, with the absolute target met directly at 76.864 <= 80.7 ms/event",
+        "P23_frontier_completeness": "at least 5 distinct optimisation moves with measured ms/event and a landed-or-rejected verdict; I expect 9 calib moves and 7 harness moves, of which 3 are rejections",
+        "P24_headroom_taken": "the best calib configuration sits within about 1.8x of the contract's 22 ms DRAM floor for the two-plane blend, so most but not all of the available calib headroom was taken"
+      },
+      "delegated": [
+        {
+          "agent": "skeptic",
+          "task": "(carried from iteration 4) score the seven pre-registered void conditions against the returned job",
+          "model": "opus",
+          "effort": "xhigh"
+        },
+        {
+          "agent": "cold-reader",
+          "task": "(carried from iteration 4) establish the four central claims from the artifacts alone and name the blocking defect",
+          "model": "inherit",
+          "effort": "xhigh"
+        }
+      ],
+      "integrated": "P22 HELD. The honest headline is 8.40-8.56x, not the 11.62x the job printed, because my own cache-control arm caught a 1.357x contamination in that ratio's denominator. Both remedies the skeptic pre-specified still clear the threshold, and the ABSOLUTE target is met directly at 76.864 <= 80.7 ms/event, which is the check the driver never had. P24 HELD: best in-situ calib is 40.24 ms/event against the contract's 22 ms two-plane DRAM floor, i.e. 1.83x the floor, so most but not all of the calib headroom was taken. P23 HELD: the frontier carries 9 calib moves and 7 harness moves, 3 of them rejections. Final numpy-only proof re-run by me at the landed SHA ce37463: grep for numba/njit under src/ exits 1 with zero matches; backend_info reports compute_backend=numpy, kernel=numpy_hybrid, compiled_extensions=[]; with numba/llvmlite/numexpr/cython/pythran ALL hard-blocked at import, 'import numba' raises ModuleNotFoundError and pscalib.calib still returns a (32,512,1024) float32 frame with bitdiff=0, signzerodiff=0, maxabsdiff=0.0 against the frozen reference, and no accelerator module is present in sys.modules afterwards. || POST-PUBLICATION, from the two iteration-4 advisors landing after I had already reported. ATTRIBUTION CORRECTION, verified by me: the 7.69x I published for pscalib's own contribution uses the CONTAMINATED cold baseline. On the conservative warm baseline the split is pscalib 5.664x times harness patch 1.511x = 8.559x, which reproduces the job's printed RATIO_CONSERVATIVE exactly. So the part that SHIPS -- pscalib's src/ -- is worth 5.66x, and the remaining 1.51x is a benchmark-harness rewrite that ships to nobody. The blind skeptic's pre-registered condition V11 anticipated this split before the numbers existed. COLD READER VERDICT: NOT usable from the artifacts alone. Every CORRECTNESS claim survives -- it reproduced numpy-only-ness and byte-exactness itself from the tree -- but the headline does not, and its blocking defect is the one my own control arm found: the arms run cold-then-warm and the job never re-takes the measurement, exiting rc=0 with target_met=True on the inflated ratio while printing that it must be re-taken. It also established that the 645.3 baseline is an INHERITED model anchor from the predecessor's timing.json, never measured in this campaign, and that after_fast2 at 80.710 ms/event misses the 80.7 ceiling by 0.01 ms. P18 and P19 both HELD.",
+      "new": "The campaign's defensible answer, stated as a range rather than a point because the instrument itself says so: 8.40x against the frozen 645.3 baseline, 8.56x against the conservative in-job baseline, and the absolute 80.7 ms/event ceiling met directly at 76.864 -- with the 11.62x the job printed explicitly NOT published, because the fourth arm I added to detect page-cache contamination found 1.357x of it. Plus the FRONTIER table of 16 attempted moves with 3 measured rejections, and a final numpy-only proof executed at the landed SHA with every accelerator hard-blocked at import.",
+      "remaining": "The headline is defensible but the evidence package is not self-serving-proof. In priority order, from the cold reader: (1) re-take the timing with interleaved arms or dropped caches, >=3 repetitions, and make cache_control_ok=False a HARD non-zero exit rather than a print -- without it the printed 11.62x outlives the caveat; (2) write a one-page CLAIM.md as the first thing in a 115-entry directory, stating the single claimed ratio and its arm, the 5.66x/1.51x split, that 645.3 is an inherited anchor, that H7_SPEC.md describes unbuilt work, and that one output file is a cancelled job; (3) emit a per-bin cube digest so the real 512-event Ray arms compare cube-to-cube, since cube_inertness only covers 64-96 events single-process. Also open: H7 itself (~6 ms/event) and the psana oracle re-run citing ce37463."
+    }
+  ]
+}
