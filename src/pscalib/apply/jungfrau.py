@@ -34,6 +34,12 @@ be absent for some runs/detectors -- callers pass ``None`` and it is treated as
 
 import numpy as np
 
+from ._fastcalib import (                       # noqa: F401
+    BACKEND as _BACKEND,
+    calib_jungfrau_fast as _calib_jungfrau_fast,
+    backend_info,
+)
+
 #: 14-bit ADC mask -- psana ``UtilsJungfrau.MSK`` (``0x3fff``, ``(1<<14)-1``).
 MSK = 0x3fff
 #: Gain-bit shift -- psana ``UtilsJungfrau.BSH`` (the gain code is ``raw >> 14``).
@@ -44,8 +50,28 @@ BSH = 14
 N_GAIN_STAGES = 3
 
 
-def calib_jungfrau(raw, pedestals, pixel_gain, pixel_offset=None, mask=None):
-    """Calibrate a raw Jungfrau stack into ADU, fully offline (numpy only).
+def calib_jungfrau_reference(raw, pedestals, pixel_gain,
+                             pixel_offset=None, mask=None):
+    """The VERBATIM c5ce538 expression -- the byte-exactness oracle.
+
+    This is the definition of correctness for :func:`calib_jungfrau`, kept in
+    the tree (not in a scratch file) so the fast path can be cross-checked
+    against it at any time, in-process, on real constants::
+
+        ref  = calib_jungfrau_reference(raw, ped, gain, off, mask)
+        fast = calib_jungfrau(raw, ped, gain, off, mask)
+        assert (ref.view(np.uint32) == fast.view(np.uint32)).all()
+
+    Do not "optimise" this function.  Every apparent redundancy in it is
+    load-bearing: the ``np.select`` default lane gives the BAD gain code
+    ``pedoff=0``/``factor=0`` so it COMPUTES ``(adc - 0.0) * 0.0`` (whose
+    sign of zero is observable); the mask multiply is what turns a
+    finite-negative masked pixel into ``-0.0``; and the three float32
+    operations round THREE times, which a float64 chain would not.
+
+    Original docstring follows.
+
+    Calibrate a raw Jungfrau stack into ADU, fully offline (numpy only).
 
     Faithful re-implementation of psana
     ``UtilsJungfrau.calib_jungfrau`` / ``calib_jungfrau_single_panel`` (looped
@@ -123,6 +149,42 @@ def calib_jungfrau(raw, pedestals, pixel_gain, pixel_offset=None, mask=None):
             arrf *= np.asarray(mask)[s].astype(np.float32)
         out[s] = arrf
     return out
+
+
+def calib_jungfrau(raw, pedestals, pixel_gain, pixel_offset=None, mask=None):
+    """Calibrate a raw Jungfrau stack into ADU, fully offline (numpy only).
+
+    Byte-identical to :func:`calib_jungfrau_reference` (the verbatim c5ce538
+    expression, kept above); this entry point merely evaluates it *faster*.  The
+    signature, the return dtype/shape and every output bit -- including the sign
+    of every zero and every NaN payload -- are unchanged.
+
+    Where the speed comes from (see :mod:`pscalib.apply._fastcalib`):
+
+    * ``poff = pedestals + pixel_offset`` and ``gfac = 1/pixel_gain`` are pure
+      functions of the calibration constants, which are fetched once per run.
+      The reference rebuilt both (two 201 MB arrays) on EVERY event; they are now
+      HOISTED into an eviction-safe identity memo.
+    * the reference materialised, per segment per event, a ``gbits`` array and
+      TWO ``np.select`` outputs the size of the segment.  The fast path instead
+      blocks the segment into spatial tiles and picks, per tile, the cheapest
+      exact strategy from a cheap ``uint16`` reduction of that tile (pure stage 0
+      / dense two-plane blend / stage-0 pass plus a sparse gather).
+    * if ``numba`` happens to be importable, a single fused float32 pass replaces
+      the tiled numpy passes.  ``numba`` is strictly OPTIONAL -- ``import
+      pscalib`` works with numpy alone and silently uses the numpy path.
+
+    The tile choice depends only on the contents of the frame being calibrated,
+    never on how events are grouped, so the result is invariant under any event
+    partition; blocking is over SPATIAL axes only.
+
+    See :func:`calib_jungfrau_reference` for the full parameter documentation.
+    """
+    if _BACKEND == "reference":
+        return calib_jungfrau_reference(raw, pedestals, pixel_gain,
+                                        pixel_offset=pixel_offset, mask=mask)
+    return _calib_jungfrau_fast(raw, pedestals, pixel_gain,
+                                pixel_offset=pixel_offset, mask=mask)
 
 
 def gain_stage_map(raw):

@@ -428,6 +428,39 @@ def mask_from_pixel_status(pixel_status, status_bits=0xffff,
     -------
     ndarray, shape ``(n_segments, 352, 384)``, uint8
     """
-    smask = status_as_mask(np.asarray(pixel_status).astype(np.uint64),
-                           status_bits=status_bits)
-    return merge_mask_for_grinds(smask, gain_range_inds=gain_range_inds)
+    ps = np.asarray(pixel_status)
+    if ps.ndim != 4:
+        # ndim < 4 -> merge_mask_for_grinds passes through and there is nothing
+        # to segment; ndim > 4 is not a shape either detector produces.  Take the
+        # verbatim path so behaviour cannot drift.
+        smask = status_as_mask(ps.astype(np.uint64), status_bits=status_bits)
+        return merge_mask_for_grinds(smask, gain_range_inds=gain_range_inds)
+    return _mask_from_pixel_status_segmented(ps, status_bits, gain_range_inds)
+
+
+def _mask_from_pixel_status_segmented(ps, status_bits, gain_range_inds):
+    """:func:`mask_from_pixel_status` segment by segment -- same bits, ~1/S the peak.
+
+    ``status_as_mask``'s ``np.select((cond,), (0,), default=1)`` uses INTEGER
+    scalars, so it materialises an **int64** array the shape of ``pixel_status``
+    -- 402 MB for a jungfrau's ``(3,32,512,1024)`` -- and
+    ``merge_mask_for_grinds`` repeats the trick once per extra gain range.  Every
+    step of that pipeline is ELEMENTWISE along the segment axis, so doing it one
+    segment at a time yields the SAME BYTES while bounding the transient peak to
+    ~1/n_segments of it.  (The campaign gate asserts byte equality against the
+    whole-array derivation rather than trusting this argument.)
+
+    The verbatim helpers are CALLED here on a ``(n_ranges, 1, rows, cols)`` slab
+    rather than re-implemented, so the per-element operation sequence is
+    literally the reference's.  The slab keeps ``ndim == 4`` on purpose --
+    otherwise ``merge_mask_for_grinds`` would short-circuit its ``ndim < 4``
+    pass-through and skip the gain-range merge entirely.
+    """
+    nseg = ps.shape[1]
+    out = np.empty((nseg,) + ps.shape[2:], dtype=np.uint8)
+    for s in range(nseg):
+        slab = ps[:, s:s + 1]                       # (n_ranges, 1, rows, cols)
+        sm = status_as_mask(np.asarray(slab).astype(np.uint64),
+                            status_bits=status_bits)
+        out[s] = merge_mask_for_grinds(sm, gain_range_inds=gain_range_inds)[0]
+    return out

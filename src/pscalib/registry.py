@@ -26,6 +26,7 @@ import os
 import numpy as np
 
 from .apply.jungfrau import calib_jungfrau, N_GAIN_STAGES as _JF_STAGES
+from .apply._fastcalib import memo as _memo
 from .apply.epix10ka import calib_epix10ka, mask_from_pixel_status
 
 __all__ = [
@@ -357,7 +358,12 @@ def _optional_const(constants, ctype, like, fill):
     val = _get_const(constants, ctype, required=False)
     if val is not None:
         return val
-    return np.full_like(np.asarray(like, dtype=np.float32), fill)
+    # HOIST: the fabricated default is a pure function of ``like``'s shape and
+    # ``fill``, but this runs on EVERY event, so a fresh 201 MB array per event
+    # was being allocated, filled and thrown away (and, being a new object each
+    # time, it also defeated the derived-constant memo downstream).
+    return _memo((like,), ("optional_const", ctype, float(fill)),
+                 lambda: np.full_like(np.asarray(like, dtype=np.float32), fill))
 
 
 # ==========================================================================
@@ -477,6 +483,31 @@ def _assert_constants_bind_raw(family, raw, constants):
 # ==========================================================================
 # Built-in plugins (the thin seam): plugin(raw, constants, config=None) -> calib
 # ==========================================================================
+def _hoisted_status_mask(status, status_bits=0xffff,
+                         gain_range_inds=(0, 1, 2, 3, 4)):
+    """:func:`mask_from_pixel_status` HOISTED across events.
+
+    The default mask is a pure function of the ``pixel_status`` CONSTANT, which
+    is fetched once per run -- yet the plugins rebuilt it on every single event,
+    and it was the single most expensive step in the whole apply (45-56% of the
+    per-event calib cost for a jungfrau: a 402 MB int64 ``np.select`` transient
+    plus two more merges, per event, to recompute the same 16 MB of bytes).
+
+    The memo is keyed on the IDENTITY of the ``status`` array (eviction-safe --
+    see :func:`pscalib.apply._fastcalib.memo`) plus the two scalar parameters, so
+    a different ``pixel_status`` object, or the same one with different
+    ``status_bits``, derives afresh.  The PUBLIC
+    :func:`~pscalib.apply.epix10ka.mask_from_pixel_status` is deliberately NOT
+    memoised: it still returns a fresh array every call, so a caller that mutates
+    the result is unaffected.  Only this internal plugin path shares.
+    """
+    return _memo((status,), ("status_mask", int(status_bits),
+                             tuple(gain_range_inds)),
+                 lambda: mask_from_pixel_status(
+                     status, status_bits=status_bits,
+                     gain_range_inds=gain_range_inds))
+
+
 def plugin_jungfrau(raw, constants, config=None):
     """Jungfrau apply plugin -- gain stage is in the raw bits, ``config`` unused.
 
@@ -502,7 +533,7 @@ def plugin_jungfrau(raw, constants, config=None):
     if mask is None:
         status = _get_const(constants, "pixel_status", required=False)
         if status is not None:
-            mask = mask_from_pixel_status(status)
+            mask = _hoisted_status_mask(status)
     return calib_jungfrau(raw, pedestals, pixel_gain,
                           pixel_offset=pixel_offset, mask=mask)
 
@@ -545,7 +576,7 @@ def plugin_epix10ka(raw, constants, config=None):
     if mask is None:
         status = _get_const(constants, "pixel_status", required=False)
         if status is not None:
-            mask = mask_from_pixel_status(status)
+            mask = _hoisted_status_mask(status)
     return calib_epix10ka(raw, pedestals, pixel_gain, config, mask=mask)
 
 
